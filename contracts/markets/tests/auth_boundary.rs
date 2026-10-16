@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use markets::{MarketsContract, MarketsContractClient};
+use markets::{ContractError, MarketsContract, MarketsContractClient};
 use soroban_sdk::{
     testutils::{Address as _, Ledger, LedgerInfo, MockAuth, MockAuthInvoke},
     Address, Env, IntoVal, String, Vec,
@@ -225,6 +225,21 @@ fn test_place_bet_requires_auth_success() {
         .client
         .try_place_bet(&setup.user1, &market_id, &outcome_index, &amount);
     assert!(result.is_ok(), "Authorized user should place bet");
+}
+
+#[test]
+fn test_place_bet_rejects_closed_market() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    let market_id = create_market_with_auth_check(&setup);
+    env.ledger().set_timestamp(1735689600 + 86400);
+
+    let result = setup
+        .client
+        .try_place_bet(&setup.user1, &market_id, &0, &100);
+    assert_eq!(result, Err(Ok(ContractError::MarketClosed)));
 }
 
 // ── resolve_market ────────────────────────────────────────────────────────────

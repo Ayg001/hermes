@@ -441,6 +441,11 @@ impl MarketsContract {
             None => panic_with_error!(env, ContractError::MarketNotFound),
         };
 
+        let now = env.ledger().timestamp();
+        if now >= market.end_time {
+            panic_with_error!(env, ContractError::MarketClosed);
+        }
+
         if market.resolved || market.cancelled {
             panic_with_error!(env, ContractError::InvalidState);
         }
