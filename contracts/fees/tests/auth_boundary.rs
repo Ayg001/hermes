@@ -698,9 +698,12 @@ fn test_pending_fee_config_inspection_and_apply() {
     // Initially no pending config
     assert_eq!(client.get_pending_fee_config(), None);
 
-    // Update stages the config
+    // Update stages the config without changing the active configuration
     let new_cfg = default_fee_config();
+    let original_cfg = client.get_fee_config();
+    assert_ne!(new_cfg, original_cfg);
     client.update_fee_config(&admin, &new_cfg);
+    assert_eq!(client.get_fee_config(), original_cfg);
 
     // Public read path returns in-flight pending configuration
     let pending = client.get_pending_fee_config().expect("pending config must be present");
