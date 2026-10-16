@@ -14,6 +14,7 @@ struct TestEnv<'a> {
     bettor1: Address,
     bettor2: Address,
     bettor3: Address,
+    token_address: Address,
     client: MarketsContractClient<'a>,
 }
 
@@ -35,6 +36,14 @@ fn setup_test_env() -> TestEnv<'static> {
     // Initialize admin
     client.transfer_ownership(&admin1, &admin1);
 
+    let token_contract = env.register_stellar_asset_contract_v2(admin1.clone());
+    let token_address = token_contract.address();
+    client.set_token_address(&admin1, &token_address);
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+    for bettor in [&bettor1, &bettor2, &bettor3] {
+        token_admin.mint(bettor, &1_000_000i128);
+    }
+
     TestEnv {
         env,
         admin1,
@@ -43,6 +52,7 @@ fn setup_test_env() -> TestEnv<'static> {
         bettor1,
         bettor2,
         bettor3,
+        token_address,
         client,
     }
 }
@@ -447,6 +457,9 @@ fn test_dust_permanently_locked_bug_is_resolved() {
     // 1. User deposits funds into internal balance
     te.client.deposit_user_balance(&te.bettor1, &10_000);
     assert_eq!(te.client.get_user_balance(&te.bettor1), 10_000);
+    let token_client = soroban_sdk::token::Client::new(&te.env, &te.token_address);
+    assert_eq!(token_client.balance(&te.bettor1), 990_000);
+    assert_eq!(token_client.balance(&te.client.address), 10_000);
 
     // 2. Perform partial withdrawal of 9_950 stroops
     // Fee = max(9950 * 1% = 99, min_fee = 100) = 100

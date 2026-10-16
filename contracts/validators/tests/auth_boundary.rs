@@ -154,6 +154,61 @@ fn test_deregister_validator_requires_auth_success() {
     }
 }
 
+#[test]
+fn test_deregister_validator_rejected_during_active_round() {
+    let env = Env::default();
+    let ts = setup_with_validator(&env);
+
+    ts.client
+        .start_resolution_round(&ts.admin, &ts.validator);
+
+    let result = ts.client.try_deregister_validator(&ts.validator);
+    assert!(
+        result.is_err(),
+        "validator must not deregister during an active resolution round"
+    );
+    assert!(
+        ts.client.is_validator(&ts.validator),
+        "validator registration must remain intact"
+    );
+}
+
+#[test]
+fn test_ending_resolution_round_allows_deregistration() {
+    let env = Env::default();
+    let ts = setup_with_validator(&env);
+
+    ts.client
+        .start_resolution_round(&ts.admin, &ts.validator);
+    ts.client.end_resolution_round(&ts.admin, &ts.validator);
+
+    let result = ts.client.try_deregister_validator(&ts.validator);
+    assert!(
+        result.is_ok(),
+        "validator must be able to deregister after the round concludes"
+    );
+}
+
+#[test]
+fn test_resolution_round_lifecycle_requires_admin_auth() {
+    let env = Env::default();
+    let ts = setup_with_validator(&env);
+
+    let start_result = ts
+        .client
+        .try_start_resolution_round(&ts.unauthorized, &ts.validator);
+    assert!(start_result.is_err(), "only admin may start a resolution round");
+
+    ts.client
+        .start_resolution_round(&ts.admin, &ts.validator);
+    let end_result = ts
+        .client
+        .try_end_resolution_round(&ts.unauthorized, &ts.validator);
+    assert!(end_result.is_err(), "only admin may end a resolution round");
+
+    assert!(ts.client.is_validator_in_active_round(&ts.validator));
+}
+
 // ===========================================================================
 // update_stake
 // ===========================================================================
@@ -386,6 +441,10 @@ fn test_view_entrypoints_do_not_require_auth() {
     // is_validator
     let exists = ts.client.is_validator(&ts.validator);
     assert!(exists, "ts.validator should be registered");
+
+    // is_validator_in_active_round
+    let in_active_round = ts.client.is_validator_in_active_round(&ts.validator);
+    assert!(!in_active_round, "validator should not be in an active round");
 
     // get_validator
     let info_opt = ts.client.get_validator(&ts.validator);
