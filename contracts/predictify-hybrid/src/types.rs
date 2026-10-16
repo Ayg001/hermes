@@ -3878,7 +3878,7 @@ pub enum BetStatus {
 /// Before a bet is placed, the following validations occur:
 /// - Market exists and is in Active state
 /// - Market has not ended (current time < end_time)
-/// - User has not already placed a bet on this market
+/// - An active bet is replaced; a resolved bet cannot be replaced
 /// - User has sufficient balance for the bet amount
 /// - Bet amount meets minimum stake requirements
 /// - Selected outcome is valid for the market

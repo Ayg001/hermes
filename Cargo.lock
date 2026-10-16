@@ -1521,6 +1521,7 @@ dependencies = [
 name = "resolution"
 version = "0.0.0"
 dependencies = [
+ "markets",
  "soroban-sdk",
 ]
 

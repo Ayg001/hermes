@@ -8,7 +8,7 @@
 //! - **Bet Placement**: Users can place bets on active markets
 //! - **Fund Locking**: User funds are locked in the contract until resolution
 //! - **Bet Tracking**: Tracks bet amount and selected outcome per user
-//! - **Double Betting Prevention**: Prevents users from betting twice on the same market
+//! - **Bet Replacement**: Replaces an existing active bet while keeping pool totals balanced
 //! - **Validation**: Comprehensive validation for market state, outcomes, and balances
 //! - **Event Emission**: Emits bet placement events for transparency
 //!
@@ -438,7 +438,8 @@ impl BetManager {
     /// Place a bet on a market outcome with fund locking.
     ///
     /// This function processes a user's bet on a prediction market, including
-    /// validation, fund locking, and bet storage.
+    /// validation, escrow adjustment, and bet storage. When replacing an active
+    /// bet, `amount` is the new total stake, not an additional stake.
     ///
     /// # Parameters
     ///
@@ -446,7 +447,7 @@ impl BetManager {
     /// - `user` - Address of the user placing the bet
     /// - `market_id` - Symbol identifying the market
     /// - `outcome` - The outcome the user is betting on
-    /// - `amount` - The amount to lock for this bet
+    /// - `amount` - The total amount to stake on this bet
     /// - `max_fee_bps` - Optional maximum platform fee percentage in basis points (slippage guard)
     ///
     /// # Returns
@@ -459,7 +460,7 @@ impl BetManager {
     /// - `Error::MarketNotFound` - Market does not exist
     /// - `Error::MarketClosed` - Market has ended or is not active
     /// - `Error::MarketResolved` - Market has already been resolved
-    /// - `Error::AlreadyBet` - User has already placed a bet on this market
+    /// - `Error::AlreadyBet` - User already has a non-active bet on this market
     /// - `Error::InsufficientStake` - Bet amount below minimum
     /// - `Error::InvalidOutcome` - Selected outcome not valid for this market
     /// - `Error::InsufficientBalance` - User doesn't have enough funds
@@ -469,9 +470,9 @@ impl BetManager {
     ///
     /// - Requires user authentication via `require_auth()`
     /// - Validates market state before accepting bet
-    /// - Validates user has not already bet on this market
+    /// - Replaces any active bet and adjusts its pool contribution and escrow
     /// - Validates user has sufficient balance
-    /// - Locks funds atomically with bet creation
+    /// - Adjusts escrow atomically with bet creation
     /// - Fee slippage guard prevents unexpected fee increases
     ///
     /// # Example
@@ -541,19 +542,42 @@ impl BetManager {
         // Enforce fee slippage guard: reject if the effective platform fee exceeds caller's max
         BetValidator::validate_fee_slippage(env, max_fee_bps)?;
 
-        // Check if user has already bet on this market
-        if let Some(existing_bet) = Self::get_bet(env, &market_id, &user) {
-            if existing_bet.status != crate::types::BetStatus::Cancelled {
-                return Err(Error::AlreadyBet);
+        // Active bets may be replaced. Cancelled bets were already removed from
+        // the pool and refunded, while resolved bets cannot be replaced.
+        let previous_bet = match Self::get_bet(env, &market_id, &user) {
+            Some(existing_bet) if existing_bet.status == crate::types::BetStatus::Active => {
+                Some(existing_bet)
             }
-        }
+            Some(existing_bet) if existing_bet.status == crate::types::BetStatus::Cancelled => None,
+            Some(_) => return Err(Error::AlreadyBet),
+            None => None,
+        };
 
         // ===== PER-USER MAX BET CAP CHECK (BEFORE funds are locked) =====
         // Load current user stake and validate it won't exceed the cap
         BetValidator::validate_user_stake_under_cap(env, &market_id, &user, amount)?;
 
-        // Lock funds (transfer from user to contract)
-        BetUtils::lock_funds(env, &user, amount)?;
+        if let Some(existing_bet) = &previous_bet {
+            // Remove the previous stake before recording its replacement.
+            Self::update_market_bet_stats_on_cancel(
+                env,
+                &market_id,
+                &existing_bet.outcome,
+                existing_bet.amount,
+            )?;
+            market.total_staked = market.total_staked.saturating_sub(existing_bet.amount);
+
+            // Transfer only the difference so the user's net locked balance
+            // matches the replacement amount.
+            if amount > existing_bet.amount {
+                BetUtils::lock_funds(env, &user, amount - existing_bet.amount)?;
+            } else if existing_bet.amount > amount {
+                BetUtils::unlock_funds(env, &user, existing_bet.amount - amount)?;
+            }
+        } else {
+            // Lock funds (transfer from user to contract)
+            BetUtils::lock_funds(env, &user, amount)?;
+        }
 
         // Token transfers are external calls; do not commit against a market
         // snapshot that may have been resolved during the transfer.
@@ -604,9 +628,9 @@ impl BetManager {
 
         MarketStateManager::update_market(env, &market_id, &market);
 
-        // Record resource snapshot for regression baseline.
-        // write_count: BetKey + BetRegistryKey + MarketBetsKey + UserStake + Market = 5 writes
-        crate::gas::BetSnapshotManager::record(env, _cpu_before, 5, &market_id);
+        // Replacing a bet writes MarketBetsKey once to remove the prior stake.
+        let write_count = if previous_bet.is_some() { 6 } else { 5 };
+        crate::gas::BetSnapshotManager::record(env, _cpu_before, write_count, &market_id);
 
         // Publish only after every fallible operation has completed. This
         // keeps a failed call from exposing an intermediate bet event.
@@ -2112,6 +2136,70 @@ mod tests {
                 let idem = crate::storage::DataKey::PlaceBetsIdem(user.clone(), key.clone());
                 assert!(!env.storage().persistent().has(&idem));
             }
+        });
+    }
+
+    #[test]
+    fn test_place_bet_replaces_existing_pool_and_escrow() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::PredictifyHybrid, ());
+        let user = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let token_address = token_contract.address();
+        let token_client = soroban_sdk::token::Client::new(&env, &token_address);
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        token_admin_client.mint(&user, &10_000_000i128);
+
+        let market_id = Symbol::new(&env, "replace_bet");
+        let yes = String::from_str(&env, "yes");
+        let no = String::from_str(&env, "no");
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&Symbol::new(&env, "TokenID"), &token_address);
+            MarketStateManager::update_market(
+                &env,
+                &market_id,
+                &test_market(&env, env.ledger().timestamp() + 10_000),
+            );
+
+            BetManager::place_bet(
+                &env,
+                user.clone(),
+                market_id.clone(),
+                yes.clone(),
+                1_000_000,
+                10_000,
+            )
+            .unwrap();
+            BetManager::place_bet(
+                &env,
+                user.clone(),
+                market_id.clone(),
+                no.clone(),
+                2_000_000,
+                10_000,
+            )
+            .unwrap();
+
+            let stats = BetManager::get_market_bet_stats(&env, &market_id);
+            assert_eq!(stats.total_bets, 1);
+            assert_eq!(stats.total_amount_locked, 2_000_000);
+            assert_eq!(stats.outcome_totals.get(yes.clone()), None);
+            assert_eq!(stats.outcome_totals.get(no.clone()), Some(2_000_000));
+
+            let market = MarketStateManager::get_market(&env, &market_id).unwrap();
+            assert_eq!(market.total_staked, 2_000_000);
+            assert_eq!(
+                token_client.balance(&env.current_contract_address()),
+                2_000_000
+            );
+
+            let bet = BetManager::get_bet(&env, &market_id, &user).unwrap();
+            assert_eq!(bet.outcome, no);
+            assert_eq!(bet.amount, 2_000_000);
         });
     }
 

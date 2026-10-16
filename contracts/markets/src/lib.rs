@@ -39,7 +39,7 @@
 pub mod errors;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, panic_with_error, Address, Env, String, Vec,
+    contract, contractimpl, contracttype, panic_with_error, Address, Env, Map, String, Vec,
 };
 
 pub use errors::ContractError;
@@ -69,6 +69,8 @@ pub enum DataKey {
     /// Written **before** any token transfer in `claim_winnings` to uphold the
     /// checks-effects-interactions pattern and prevent reentrancy double-claims.
     ClaimedBet(u32, Address),
+    /// Winning outcome indices recorded when a market is resolved.
+    WinningOutcomes(u32),
 
     // ── Issue #007: Hardened Pause Keys ─────────────────────────────
     /// Counter for generating unique pause proposal IDs.
@@ -310,6 +312,19 @@ impl MarketsContract {
             _ => panic_with_error!(env, ContractError::InvalidPayoutCurve),
         }
     }
+
+    fn winning_outcomes(env: &Env, market_id: u32, market: &MarketData) -> Vec<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WinningOutcomes(market_id))
+            .unwrap_or_else(|| {
+                let mut outcomes = Vec::new(env);
+                if market.resolved {
+                    outcomes.push_back(market.winning_outcome);
+                }
+                outcomes
+            })
+    }
 }
 
 #[contractimpl]
@@ -332,6 +347,45 @@ impl MarketsContract {
                 .extend_ttl(&market_id, 6307200, 6307200);
         }
         market
+    }
+
+    /// Read the metadata required by the resolution subsystem.
+    pub fn get_market_for_resolution(
+        env: Env,
+        market_id: u32,
+    ) -> Option<(Address, u64, u32, bool, bool)> {
+        let key = DataKey::Market(market_id);
+        let market: Option<MarketData> = env.storage().persistent().get(&key);
+        if market.is_some() {
+            let ttl = 6_307_200u32.min(env.storage().max_ttl());
+            env.storage().persistent().extend_ttl(&key, ttl, ttl);
+        }
+        market.map(|market| {
+            (
+                market.creator,
+                market.end_time,
+                market.outcome_tags.len(),
+                market.resolved,
+                market.cancelled,
+            )
+        })
+    }
+
+    /// Return every winning outcome for a resolved market.
+    pub fn get_winning_outcomes(env: Env, market_id: u32) -> Option<Vec<u32>> {
+        let market_key = DataKey::Market(market_id);
+        let market: Option<MarketData> = env.storage().persistent().get(&market_key);
+        market.map(|market| {
+            let ttl = 6_307_200u32.min(env.storage().max_ttl());
+            env.storage().persistent().extend_ttl(&market_key, ttl, ttl);
+            let outcomes_key = DataKey::WinningOutcomes(market_id);
+            if env.storage().persistent().has(&outcomes_key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&outcomes_key, ttl, ttl);
+            }
+            Self::winning_outcomes(&env, market_id, &market)
+        })
     }
 
     /// Returns whether market operations are currently paused globally.
@@ -442,6 +496,11 @@ impl MarketsContract {
             Some(m) => m,
             None => panic_with_error!(env, ContractError::MarketNotFound),
         };
+
+        let now = env.ledger().timestamp();
+        if now >= market.end_time {
+            panic_with_error!(env, ContractError::MarketClosed);
+        }
 
         if market.resolved || market.cancelled {
             panic_with_error!(env, ContractError::InvalidState);
@@ -577,6 +636,76 @@ impl MarketsContract {
         env.storage()
             .persistent()
             .set(&DataKey::Market(market_id), &market);
+        let mut winning_outcomes = Vec::new(&env);
+        winning_outcomes.push_back(winning_outcome);
+        env.storage()
+            .persistent()
+            .set(&DataKey::WinningOutcomes(market_id), &winning_outcomes);
+        let ttl = 6_307_200u32.min(env.storage().max_ttl());
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::WinningOutcomes(market_id), ttl, ttl);
+    }
+
+    /// Resolves a market with one or more winning outcomes.
+    ///
+    /// Only the market creator may resolve it, and only after betting closes.
+    pub fn resolve_market_with_outcomes(
+        env: Env,
+        resolver: Address,
+        market_id: u32,
+        winning_outcomes: Vec<u32>,
+    ) {
+        resolver.require_auth();
+
+        let mut market: MarketData =
+            match env.storage().persistent().get(&DataKey::Market(market_id)) {
+                Some(market) => market,
+                None => panic_with_error!(env, ContractError::MarketNotFound),
+            };
+
+        if market.resolved {
+            panic_with_error!(env, ContractError::MarketAlreadyResolved);
+        }
+        if market.cancelled {
+            panic_with_error!(env, ContractError::InvalidState);
+        }
+        if resolver != market.creator {
+            panic_with_error!(env, ContractError::Unauthorized);
+        }
+        if env.ledger().timestamp() < market.end_time {
+            panic_with_error!(env, ContractError::MarketClosed);
+        }
+        if winning_outcomes.is_empty() {
+            panic_with_error!(env, ContractError::InvalidConfig);
+        }
+
+        if winning_outcomes.len() > market.outcome_tags.len() {
+            panic_with_error!(env, ContractError::InvalidConfig);
+        }
+        let mut seen = Map::<u32, bool>::new(&env);
+        for outcome in winning_outcomes.iter() {
+            if outcome >= market.outcome_tags.len() {
+                panic_with_error!(env, ContractError::InvalidOutcome);
+            }
+            if seen.contains_key(outcome) {
+                panic_with_error!(env, ContractError::InvalidConfig);
+            }
+            seen.set(outcome, true);
+        }
+
+        market.resolved = true;
+        market.winning_outcome = winning_outcomes.get(0).unwrap();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Market(market_id), &market);
+        env.storage()
+            .persistent()
+            .set(&DataKey::WinningOutcomes(market_id), &winning_outcomes);
+        let ttl = 6_307_200u32.min(env.storage().max_ttl());
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::WinningOutcomes(market_id), ttl, ttl);
     }
 
     /// Previews the payout amount for a claimant on a market (#014).
@@ -616,6 +745,27 @@ impl MarketsContract {
             .persistent()
             .get(&DataKey::OutcomePool(market_id, market.winning_outcome))
             .unwrap_or(0);
+
+        let winning_outcomes = Self::winning_outcomes(&env, market_id, &market);
+        if winning_outcomes.len() > 1 {
+            if !winning_outcomes.contains(bet.outcome_index) {
+                return 0;
+            }
+            let outcome_pool: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::OutcomePool(market_id, bet.outcome_index))
+                .unwrap_or(0);
+            if outcome_pool == 0 {
+                return bet.amount;
+            }
+            let per_outcome_pool = total_pool / winning_outcomes.len() as i128;
+            let weighted_pool = match bet.amount.checked_mul(per_outcome_pool) {
+                Some(value) => value,
+                None => panic_with_error!(env, ContractError::Overflow),
+            };
+            return weighted_pool / outcome_pool;
+        }
 
         match curve.curve_type {
             PayoutCurveConfig::WINNER_TAKES_ALL => {

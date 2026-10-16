@@ -256,8 +256,7 @@ impl FeesContract {
 
     /// Updates the complete fee configuration.
     ///
-    /// Stages the update in pending storage with a governance timelock,
-    /// and applies it immediately if direct update is configured.
+    /// Stages the update in pending storage with a governance timelock.
     ///
     /// # Authorization
     /// The `admin` caller must authenticate via `require_auth()` and must be
@@ -305,11 +304,6 @@ impl FeesContract {
         env.storage()
             .persistent()
             .remove(&Symbol::new(&env, FEE_COMMIT_KEY));
-
-        // Store new config
-        env.storage()
-            .persistent()
-            .set(&Symbol::new(&env, FEE_CONFIG_KEY), &new_config);
 
         Ok(())
     }
