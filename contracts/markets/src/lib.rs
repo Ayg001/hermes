@@ -95,6 +95,8 @@ pub enum DataKey {
     // ── Issue #012: Dust-Safe Balance & Fee Keys ────────────────────
     /// Internal balance for a user.
     UserBalance(Address),
+    /// Token contract used to fund user balances.
+    TokenAddress,
     /// Minimum fee amount threshold in stroops.
     MinFeeAmount,
     /// Withdrawal fee in basis points (1 = 0.01%).
@@ -955,6 +957,14 @@ impl MarketsContract {
             .unwrap_or(0i128)
     }
 
+    /// Configures the token contract used for user balance deposits.
+    pub fn set_token_address(env: Env, admin: Address, token_address: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenAddress, &token_address);
+    }
+
     /// Returns the total platform fees collected (#012).
     pub fn get_collected_fees(env: Env) -> i128 {
         env.storage()
@@ -976,6 +986,14 @@ impl MarketsContract {
             Some(b) => b,
             None => panic_with_error!(env, ContractError::Overflow),
         };
+
+        let token_address: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TokenAddress)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::InvalidState));
+        let token_client = soroban_sdk::token::Client::new(&env, &token_address);
+        token_client.transfer(&user, &env.current_contract_address(), &amount);
 
         env.storage()
             .persistent()
