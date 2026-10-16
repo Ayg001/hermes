@@ -1,7 +1,40 @@
 #![cfg(test)]
 
 use fees::{ContractError, FeeConfig, FeesContract, FeesContractClient};
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use soroban_sdk::{contract, contractimpl, testutils::Address as _, Address, Env};
+use std::ops::Deref;
+
+#[contract]
+struct MockAuthorizedCaller;
+
+#[contractimpl]
+impl MockAuthorizedCaller {
+    pub fn record_fee(
+        env: Env,
+        fees_contract: Address,
+        caller: Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        match FeesContractClient::new(&env, &fees_contract).try_record_fee(&caller, &amount) {
+            Ok(()) => Ok(()),
+            Err(Ok(error)) => Err(error),
+            Err(Err(_)) => panic!("Fee contract invocation failed unexpectedly"),
+        }
+    }
+}
+
+struct InitializedFees<'a> {
+    client: FeesContractClient<'a>,
+    contract_id: Address,
+}
+
+impl<'a> Deref for InitializedFees<'a> {
+    type Target = FeesContractClient<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
 
 // ============================================================
 // Test Helpers
@@ -15,14 +48,32 @@ use soroban_sdk::{testutils::Address as _, Address, Env};
 /// `require_auth()` calls will pass for the rest of the test.
 /// Tests that need to verify `require_auth()` rejection (as opposed
 /// to admin authorization) must use a fresh `Env`.
-fn register_and_initialize<'a>(env: &Env, admin: &Address) -> FeesContractClient<'a> {
+fn register_and_initialize<'a>(env: &Env, admin: &Address) -> InitializedFees<'a> {
     let contract_id = env.register(FeesContract, ());
     let client = FeesContractClient::new(env, &contract_id);
     env.mock_all_auths();
     client.initialize(admin);
     // Drain auth snapshot from initialization
     let _ = env.auths();
-    client
+    InitializedFees {
+        client,
+        contract_id,
+    }
+}
+
+fn invoke_as_authorized_caller<T>(
+    env: &Env,
+    fees: &InitializedFees,
+    amount: i128,
+    invoke: impl FnOnce(&MockAuthorizedCallerClient, &Address, &Address, &i128) -> T,
+) -> (T, Address) {
+    let caller_id = env.register(MockAuthorizedCaller, ());
+    fees.authorize_caller(&fees.get_admin(), &caller_id);
+    let _ = env.auths();
+
+    let caller = MockAuthorizedCallerClient::new(env, &caller_id);
+    let result = invoke(&caller, &fees.contract_id, &caller_id, &amount);
+    (result, caller_id)
 }
 
 fn default_fee_config() -> FeeConfig {
@@ -220,10 +271,11 @@ fn test_collect_fees_succeeds_with_admin_auth() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let client = register_and_initialize(&env, &admin);
-    let user = Address::generate(&env);
 
     // Record enough fees to meet the default collection threshold (100M stroops)
-    client.record_fee(&user, &150_000_000);
+    let _ = invoke_as_authorized_caller(&env, &client, 150_000_000, |market, fees, caller, amount| {
+        market.record_fee(fees, caller, amount)
+    });
     // Drain auth from record_fee
     let _ = env.auths();
 
@@ -239,7 +291,6 @@ fn test_collect_fees_fails_below_threshold() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let client = register_and_initialize(&env, &admin);
-    let user = Address::generate(&env);
 
     // Initial schedule should be Ready
     assert_eq!(
@@ -248,7 +299,9 @@ fn test_collect_fees_fails_below_threshold() {
     );
 
     // Record a tiny amount below the default threshold (100M stroops)
-    client.record_fee(&user, &100);
+    let _ = invoke_as_authorized_caller(&env, &client, 100, |market, fees, caller, amount| {
+        market.record_fee(fees, caller, amount)
+    });
 
     let result = client.try_collect_fees(&admin);
     match result {
@@ -268,7 +321,6 @@ fn test_fee_withdrawal_status_failed_and_recovery() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let client = register_and_initialize(&env, &admin);
-    let user = Address::generate(&env);
 
     // 1. Initial state is Ready
     let initial_schedule = client.get_withdrawal_schedule();
@@ -284,7 +336,9 @@ fn test_fee_withdrawal_status_failed_and_recovery() {
     assert_eq!(failed_schedule.status, fees::FeeWithdrawalStatus::Failed);
 
     // 3. Deposit sufficient fees exceeding threshold (150M stroops > 100M threshold)
-    client.record_fee(&user, &150_000_000);
+    let _ = invoke_as_authorized_caller(&env, &client, 150_000_000, |market, fees, caller, amount| {
+        market.record_fee(fees, caller, amount)
+    });
 
     // 4. Retry collection and verify successful transition to Completed
     let success_result = client.try_collect_fees(&admin);
@@ -335,11 +389,13 @@ fn test_pause_fees_prevents_record_fee() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let client = register_and_initialize(&env, &admin);
-    let user = Address::generate(&env);
 
     client.pause_fees(&admin);
 
-    let result = client.try_record_fee(&user, &1000);
+    let (result, _) =
+        invoke_as_authorized_caller(&env, &client, 1000, |market, fees, caller, amount| {
+            market.try_record_fee(fees, caller, amount)
+        });
     match result {
         Err(Ok(ContractError::FeesPaused)) => {} // Expected
         other => panic!(
@@ -461,26 +517,65 @@ fn test_transfer_admin_new_admin_can_operate() {
 // Auth Boundary Tests — record_fee
 // ============================================================
 
-/// `record_fee` uses `payer.require_auth()` instead of admin
-/// authorization. Any address can record a fee for itself.
+/// `record_fee` requires an admin-authorized contract to authenticate.
 /// Because `mock_all_auths` must be active after initialization,
-/// we verify the authorization via `env.auths()` — the payer
+/// we verify the authorization via `env.auths()` — the contract
 /// address must appear in the auth snapshot.
 #[test]
-fn test_record_fee_requires_payer_auth() {
+fn test_record_fee_requires_authorized_caller_auth() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let client = register_and_initialize(&env, &admin);
-    let payer = Address::generate(&env);
-
-    client.record_fee(&payer, &1000);
+    let (_, authorized_caller) =
+        invoke_as_authorized_caller(&env, &client, 1000, |market, fees, caller, amount| {
+            market.record_fee(fees, caller, amount)
+        });
 
     let auths = env.auths();
     assert_eq!(auths.len(), 1);
     assert_eq!(
-        auths[0].0, payer,
-        "record_fee should authenticate the payer, not the admin"
+        auths[0].0, authorized_caller,
+        "record_fee should authenticate the authorized contract"
     );
+}
+
+#[test]
+fn test_record_fee_rejects_unauthorized_caller() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let client = register_and_initialize(&env, &admin);
+    let unauthorized_caller = Address::generate(&env);
+
+    let result = client.try_record_fee(&unauthorized_caller, &1000);
+    assert!(
+        matches!(result, Err(Ok(ContractError::Unauthorized))),
+        "An unapproved caller must not record fees"
+    );
+    assert_eq!(client.get_collected_fees(), 0);
+}
+
+#[test]
+fn test_admin_manages_authorized_callers() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let client = register_and_initialize(&env, &admin);
+    let authorized = env.register(MockAuthorizedCaller, ());
+    let non_admin = Address::generate(&env);
+
+    assert!(!client.is_authorized_caller(&authorized));
+    client.authorize_caller(&admin, &authorized);
+    assert!(client.is_authorized_caller(&authorized));
+
+    let result = client.try_revoke_caller(&non_admin, &authorized);
+    assert!(matches!(result, Err(Ok(ContractError::Unauthorized))));
+    assert!(client.is_authorized_caller(&authorized));
+
+    client.revoke_caller(&admin, &authorized);
+    assert!(!client.is_authorized_caller(&authorized));
+
+    let caller = MockAuthorizedCallerClient::new(&env, &authorized);
+    let result = caller.try_record_fee(&client.contract_id, &authorized, &1000);
+    assert!(matches!(result, Err(Ok(ContractError::Unauthorized))));
 }
 
 #[test]
@@ -488,17 +583,21 @@ fn test_record_fee_rejects_zero_or_negative() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let client = register_and_initialize(&env, &admin);
-    let user = Address::generate(&env);
 
     // Zero amount should fail
-    let result = client.try_record_fee(&user, &0);
+    let (result, _) = invoke_as_authorized_caller(&env, &client, 0, |market, fees, caller, amount| {
+        market.try_record_fee(fees, caller, amount)
+    });
     match result {
         Err(Ok(ContractError::InvalidInput)) => {} // Expected
         other => panic!("Zero fee should be rejected, got: {:?}", other),
     }
 
     // Negative amount should fail
-    let result = client.try_record_fee(&user, &-100);
+    let (result, _) =
+        invoke_as_authorized_caller(&env, &client, -100, |market, fees, caller, amount| {
+            market.try_record_fee(fees, caller, amount)
+        });
     match result {
         Err(Ok(ContractError::InvalidInput)) => {} // Expected
         other => panic!("Negative fee should be rejected, got: {:?}", other),
@@ -599,12 +698,17 @@ fn test_all_state_changing_entrypoints_require_auth() {
         "transfer_admin should reject non-admin"
     );
 
-    // record_fee uses payer auth, not admin auth — verify via auth snapshot
-    let payer = Address::generate(&env);
-    client.record_fee(&payer, &1000);
+    // record_fee authenticates its authorized contract caller, not the admin.
+    let (_, authorized_caller) =
+        invoke_as_authorized_caller(&env, &client, 1000, |market, fees, caller, amount| {
+            market.record_fee(fees, caller, amount)
+        });
     let auths = env.auths();
     assert_eq!(auths.len(), 1);
-    assert_eq!(auths[0].0, payer, "record_fee should auth the payer");
+    assert_eq!(
+        auths[0].0, authorized_caller,
+        "record_fee should auth the authorized contract"
+    );
 }
 
 #[test]
@@ -612,7 +716,6 @@ fn test_all_state_changing_entrypoints_succeed_with_proper_auth() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let client = register_and_initialize(&env, &admin);
-    let user = Address::generate(&env);
 
     let config = default_fee_config();
 
@@ -633,10 +736,14 @@ fn test_all_state_changing_entrypoints_succeed_with_proper_auth() {
         "Admin should invoke unpause_fees"
     );
 
-    // record_fee uses payer auth
+    // record_fee requires an authorized contract caller.
     assert!(
-        client.try_record_fee(&user, &200_000_000).is_ok(),
-        "User should invoke record_fee"
+        invoke_as_authorized_caller(&env, &client, 200_000_000, |market, fees, caller, amount| {
+            market.try_record_fee(fees, caller, amount)
+        })
+        .0
+        .is_ok(),
+        "Authorized contract should invoke record_fee"
     );
 
     // collect_fees needs fees above default threshold (100M stroops)

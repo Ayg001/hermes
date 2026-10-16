@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Map, Symbol};
 
 mod errors;
 pub use errors::ContractError;
@@ -94,6 +94,12 @@ const WITHDRAWAL_SCHEDULE_KEY: &str = "WithdrawalSchedule";
 const FEE_COMMIT_KEY: &str = "FeeCommit";
 const FEE_QUEUED_KEY: &str = "FeeQueued";
 
+#[contracttype]
+#[derive(Clone)]
+enum DataKey {
+    AuthorizedCallers,
+}
+
 /// Default timelock cooldown in seconds for fee updates (24 hours).
 const DEFAULT_TIMELOCK_SECONDS: u64 = 86_400;
 
@@ -113,9 +119,9 @@ pub struct FeesContract;
 ///
 /// ## Authorization
 ///
-/// All state-changing entrypoints require the caller to authenticate via
-/// `require_auth()`. The caller must be the registered admin, set during
-/// initialization or transferred by a previous admin.
+/// State-changing entrypoints require authentication. Admin operations are
+/// restricted to the registered admin; `record_fee` is restricted to an
+/// admin-authorized contract.
 ///
 /// Read-only entrypoints do not require authentication.
 ///
@@ -133,6 +139,9 @@ pub struct FeesContract;
 /// | `pause_fees`           | Yes           | Pause fee collection                     |
 /// | `unpause_fees`         | Yes           | Resume fee collection                    |
 /// | `transfer_admin`       | Yes           | Transfer admin to a new address          |
+/// | `authorize_caller`     | Yes           | Allow a contract to record fees           |
+/// | `revoke_caller`        | Yes           | Remove a contract's fee-recording access  |
+/// | `record_fee`           | Yes           | Record fees from an authorized contract  |
 ///
 /// ## Read-only entrypoints (no auth)
 ///
@@ -144,6 +153,7 @@ pub struct FeesContract;
 /// | `get_pending_fee_config`   | Read in-flight queued update (if any)    |
 /// | `get_admin`                | Read admin address                       |
 /// | `get_collected_fees`       | Read collected fees balance              |
+/// | `is_authorized_caller`     | Check fee-recording authorization        |
 #[contractimpl]
 impl FeesContract {
     // ========================================================
@@ -193,6 +203,10 @@ impl FeesContract {
         env.storage()
             .persistent()
             .set(&Symbol::new(&env, COLLECTED_FEES_KEY), &0i128);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuthorizedCallers, &Map::<Address, bool>::new(&env));
 
         // Initialize fees as not paused
         env.storage()
@@ -386,6 +400,73 @@ impl FeesContract {
         Ok(())
     }
 
+    /// Authorizes a contract to record fees.
+    ///
+    /// # Authorization
+    /// The `admin` caller must authenticate via `require_auth()` and be the
+    /// registered admin.
+    pub fn authorize_caller(
+        env: Env,
+        admin: Address,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        Self::assert_is_admin(&env, &admin)?;
+
+        let mut callers: Map<Address, bool> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuthorizedCallers)
+            .unwrap_or(Map::new(&env));
+        callers.set(caller, true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuthorizedCallers, &callers);
+
+        Ok(())
+    }
+
+    /// Revokes a contract's permission to record fees.
+    ///
+    /// # Authorization
+    /// The `admin` caller must authenticate via `require_auth()` and be the
+    /// registered admin.
+    pub fn revoke_caller(
+        env: Env,
+        admin: Address,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        Self::assert_is_admin(&env, &admin)?;
+
+        let mut callers: Map<Address, bool> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuthorizedCallers)
+            .unwrap_or(Map::new(&env));
+        callers.remove(caller);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuthorizedCallers, &callers);
+
+        Ok(())
+    }
+
+    /// Returns whether an address is authorized to record fees.
+    pub fn is_authorized_caller(env: Env, caller: Address) -> bool {
+        Self::is_authorized_caller_internal(&env, &caller)
+    }
+
+    /// Checks whether an address is in the authorized fee-recording set.
+    fn is_authorized_caller_internal(env: &Env, caller: &Address) -> bool {
+        let callers: Map<Address, bool> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuthorizedCallers)
+            .unwrap_or(Map::new(env));
+        callers.get(caller.clone()).unwrap_or(false)
+    }
+
     /// Collects accumulated fees and transfers them to the admin.
     ///
     /// # Authorization
@@ -448,14 +529,18 @@ impl FeesContract {
 
     /// Records a fee payment, incrementing the collected fees balance.
     ///
-    /// This is typically called by other contracts (e.g., markets) when a
-    /// fee-generating action occurs. The caller must authenticate.
+    /// This is typically called by authorized contracts (e.g., markets) when a
+    /// fee-generating action occurs. The caller contract must authenticate.
     ///
     /// # Authorization
-    /// The `payer` must authenticate via `require_auth()`.
-    pub fn record_fee(env: Env, payer: Address, amount: i128) -> Result<(), ContractError> {
+    /// The authorized calling contract must authenticate via `require_auth()`.
+    pub fn record_fee(env: Env, caller: Address, amount: i128) -> Result<(), ContractError> {
         // ---- AUTH: require caller authentication before any state mutation ----
-        payer.require_auth();
+        caller.require_auth();
+
+        if !Self::is_authorized_caller_internal(&env, &caller) {
+            return Err(ContractError::Unauthorized);
+        }
 
         if amount <= 0 {
             return Err(ContractError::InvalidInput);
