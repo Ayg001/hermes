@@ -74,7 +74,7 @@ pub enum ResolutionState {
 /// // Calculate confidence score
 /// let confidence = MarketResolutionManager::calculate_oracle_confidence(&oracle_resolution);
 /// println!("Oracle confidence: {}%", confidence);
-/// # Ok::<(), predictify_hybrid::errors::Error>(())
+/// # Ok::<(), predictify_hybrid::Error>(())
 /// ```
 ///
 /// # Price Comparison Logic
@@ -98,7 +98,7 @@ pub enum ResolutionState {
 /// )?;
 ///
 /// assert_eq!(outcome, String::from_str(&env, "yes")); // BTC > $50k = "yes"
-/// # Ok::<(), predictify_hybrid::errors::Error>(())
+/// # Ok::<(), predictify_hybrid::Error>(())
 /// ```
 ///
 /// # Validation Requirements
@@ -1360,6 +1360,7 @@ impl MarketResolutionManager {
             &env, &market_id, env.ledger().timestamp(),
         );
         env.storage().persistent().set(&market_id, &market);
+        crate::markets::MarketReadCache::new(&env).invalidate(&market_id);
 
         let _ = bets::BetManager::resolve_market_bets(&env, &market_id, &winning_outcomes_vec);
         let _ = resolution::ResolutionOutcomeCache::refresh(&env, &market_id);
@@ -1412,6 +1413,7 @@ impl MarketResolutionManager {
             &env, &market_id, env.ledger().timestamp(),
         );
         env.storage().persistent().set(&market_id, &market);
+        crate::markets::MarketReadCache::new(&env).invalidate(&market_id);
 
         let _ = bets::BetManager::resolve_market_bets(&env, &market_id, &winning_outcomes);
         let _ = resolution::ResolutionOutcomeCache::refresh(&env, &market_id);
@@ -1469,6 +1471,7 @@ impl MarketResolutionManager {
         );
 
         env.storage().persistent().set(&market_id, &market);
+        crate::markets::MarketReadCache::new(&env).invalidate(&market_id);
 
         crate::force_resolve::ForceResolveManager::mark_resolved(
             &env, &market_id, &idempotency_key, &admin, &winning_outcomes,

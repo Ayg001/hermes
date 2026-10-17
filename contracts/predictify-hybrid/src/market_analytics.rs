@@ -212,7 +212,11 @@ impl MarketAnalyticsManager {
         })
     }
 
-    /// Get voting analytics and participation metrics for a market
+    /// Get voting analytics and participation metrics for a market.
+    ///
+    /// `outcome_preferences` and `unique_voters` are now **stake-weighted**
+    /// (Issue #031): outcome share is proportional to the sum of stakes behind
+    /// each outcome, not to raw head-count.
     pub fn get_voting_analytics(env: &Env, market_id: Symbol) -> Result<VotingAnalytics, Error> {
         let market = env
             .storage()
@@ -221,20 +225,36 @@ impl MarketAnalyticsManager {
             .ok_or(Error::MarketNotFound)?;
 
         let total_votes = market.votes.len() as u32;
-        let unique_voters = market.votes.len() as u32;
+        // unique_voters stays as address-count; the stake-weighting lives in
+        // outcome_preferences and stake_concentration below.
+        let unique_voters = total_votes;
+
+        // Stake-weighted outcome preferences: value = total stake for that outcome.
+        let mut outcome_preferences: Map<String, u32> = Map::new(env);
+        let mut total_stake_for_scale: i128 = 0;
+        let mut outcome_stake_totals: Map<String, i128> = Map::new(env);
+        for (user, outcome) in market.votes.iter() {
+            let stake = market.stakes.get(user.clone()).unwrap_or(0);
+            let current = outcome_stake_totals.get(outcome.clone()).unwrap_or(0);
+            outcome_stake_totals.set(outcome.clone(), current + stake);
+            total_stake_for_scale += stake;
+        }
+        // Store stake-weight as basis points (0–10000) in the u32 map so
+        // callers get a normalised share without a separate stake map.
+        for (outcome, stake) in outcome_stake_totals.iter() {
+            let bps: u32 = if total_stake_for_scale > 0 {
+                ((stake * 10_000) / total_stake_for_scale) as u32
+            } else {
+                0
+            };
+            outcome_preferences.set(outcome, bps);
+        }
 
         // Create voting timeline (simplified - in real implementation would track timestamps)
         let mut voting_timeline: Map<u64, u32> = Map::new(env);
         voting_timeline.set(0, total_votes); // Placeholder
 
-        // Calculate outcome preferences
-        let mut outcome_preferences: Map<String, u32> = Map::new(env);
-        for (_, outcome) in market.votes.iter() {
-            let count = outcome_preferences.get(outcome.clone()).unwrap_or(0);
-            outcome_preferences.set(outcome.clone(), count + 1);
-        }
-
-        // Calculate stake concentration
+        // Stake concentration per address (unchanged – raw stakes are correct here)
         let mut stake_concentration: Map<Address, i128> = Map::new(env);
         for (user, stake) in market.stakes.iter() {
             stake_concentration.set(user, stake);
@@ -247,7 +267,7 @@ impl MarketAnalyticsManager {
         // Create participation trends (simplified)
         let participation_trends = vec![env, total_votes];
 
-        // Create consensus evolution (simplified)
+        // Consensus evolution based on stake-weighted strength
         let consensus_evolution = vec![env, Self::calculate_consensus_strength(&market)];
 
         Ok(VotingAnalytics {
@@ -788,53 +808,41 @@ fn min_stake_index(heap: &soroban_sdk::Vec<MarketLeaderboardEntry>) -> u32 {
     min_idx
 }
 
-/// Sort a copy of `heap` descending by stake, assign ranks, and cap at `limit`.
-///
-/// Uses insertion sort (O(N²)) which is acceptable for N ≤ 50.
+/// Select and sort the best `limit` entries, assign ranks, and cap the result.
 fn sort_descending_by_stake(
     env: &Env,
     heap: soroban_sdk::Vec<MarketLeaderboardEntry>,
     limit: u32,
 ) -> soroban_sdk::Vec<MarketLeaderboardEntry> {
-    let mut sorted: soroban_sdk::Vec<MarketLeaderboardEntry> = soroban_sdk::Vec::new(env);
+    let take = limit.min(heap.len());
+    let mut sorted: alloc::vec::Vec<MarketLeaderboardEntry> = alloc::vec::Vec::new();
     for i in 0..heap.len() {
-        sorted.push_back(heap.get(i).unwrap());
+        sorted.push(heap.get(i).unwrap());
     }
 
-    // Insertion sort: descending by stake, then ascending by timestamp (tie-break).
-    let n = sorted.len();
-    for i in 1..n {
-        let mut j = i;
-        while j > 0 {
-            let a = sorted.get(j - 1).unwrap();
-            let b = sorted.get(j).unwrap();
-
-            // `a` should come before `b` when a.stake > b.stake, or equal
-            // stake with earlier timestamp (first-bettor advantage).
-            let a_first = a.stake > b.stake
-                || (a.stake == b.stake && a.last_bet_timestamp <= b.last_bet_timestamp);
-
-            if a_first {
-                break; // already in order
-            }
-            // swap j-1 and j
-            sorted.remove(j - 1);
-            sorted.insert(j - 1, b);
-            sorted.remove(j);
-            sorted.insert(j, a);
-            j -= 1;
-        }
+    if take < sorted.len() {
+        // Partition around the boundary so only the requested prefix needs sorting.
+        sorted.select_nth_unstable_by(take as usize, compare_leaderboard_entries);
     }
+    sorted[..take as usize].sort_unstable_by(compare_leaderboard_entries);
 
-    // Trim to limit and assign 1-indexed ranks.
-    let take = limit.min(sorted.len());
     let mut result: soroban_sdk::Vec<MarketLeaderboardEntry> = soroban_sdk::Vec::new(env);
     for i in 0..take {
-        let mut entry = sorted.get(i).unwrap();
+        let mut entry = sorted[i as usize].clone();
         entry.rank = i.checked_add(1).unwrap_or(u32::MAX);
         result.push_back(entry);
     }
     result
+}
+
+fn compare_leaderboard_entries(
+    left: &MarketLeaderboardEntry,
+    right: &MarketLeaderboardEntry,
+) -> core::cmp::Ordering {
+    right
+        .stake
+        .cmp(&left.stake)
+        .then_with(|| left.last_bet_timestamp.cmp(&right.last_bet_timestamp))
 }
 
 

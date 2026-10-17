@@ -1015,7 +1015,7 @@ impl DisputeManager {
             0
         };
 
-        for i in start_idx..history.len().saturating_sub(1) {
+        for i in start_idx..history.len() {
             if let Some(prev_dispute) = history.get(i) {
                 if prev_dispute.user != user {
                     let stake_diff = if prev_dispute.stake > stake { prev_dispute.stake - stake } else { stake - prev_dispute.stake };
@@ -2150,24 +2150,25 @@ impl DisputeManager {
     /// # Errors
     ///
     /// - [`Error::ConfigNotFound`] — voting record not found
-    pub fn determine_timeout_outcome(
+  pub fn determine_timeout_outcome(
         env: &Env,
         dispute_id: Symbol,
     ) -> Result<DisputeTimeoutOutcome, Error> {
-        // Get dispute voting data
         let voting_data = DisputeUtils::get_dispute_voting(env, &dispute_id)?;
+        let timeout = DisputeUtils::get_dispute_timeout(env, &dispute_id)?;
 
-        // Determine outcome based on stake-weighted voting
-        let outcome = if voting_data.total_support_stake > voting_data.total_against_stake {
+        // Minimal check: if zero votes, explicitly treat outcome as expired/against
+        let outcome = if voting_data.total_support_stake == 0 && voting_data.total_against_stake == 0 {
+            String::from_str(env, "Against") // Or your zero-vote fallback
+        } else if voting_data.total_support_stake > voting_data.total_against_stake {
             String::from_str(env, "Support")
         } else {
             String::from_str(env, "Against")
         };
 
-        // Create timeout outcome
         let timeout_outcome = DisputeTimeoutOutcome {
             dispute_id: dispute_id.clone(),
-            market_id: Symbol::new(env, ""), // Will be set properly
+            market_id: timeout.market_id, // Fixes the empty symbol bug too
             outcome,
             resolution_method: String::from_str(env, "Timeout Auto-Resolution"),
             resolution_timestamp: env.ledger().timestamp(),
@@ -3376,23 +3377,33 @@ impl DisputeAnalytics {
         (weight * 100.0) as i128
     }
 
-    /// Determine which outcome the community favours by summing stake-weighted votes.
+    /// Determine which outcome the community favours using **stake-weighted**
+    /// voting (Issue #031).
     ///
-    /// Returns a [`CommunityConsensus`] with the winning outcome, the
-    /// confidence as an integer percentage, and the total vote stake.
+    /// Each voter's influence is proportional to the amount they staked, not
+    /// the number of addresses that voted. This prevents a sybil-style attack
+    /// where many low-stake addresses outvote a single high-economic-exposure
+    /// participant.
+    ///
+    /// Returns a [`CommunityConsensus`] where:
+    /// - `outcome` is the outcome with the highest total backing stake.
+    /// - `confidence` is `(max_outcome_stake * 100) / total_stake` (0–100).
+    /// - `total_votes` is the sum of all staked amounts across all outcomes.
     pub fn calculate_community_consensus(env: &Env, market: &Market) -> CommunityConsensus {
-        let mut outcome_totals = Map::new(env);
-        let mut total_votes = 0;
+        // Accumulate total stake per outcome.
+        let mut outcome_totals: Map<String, i128> = Map::new(env);
+        let mut total_stake: i128 = 0;
 
         for (user, outcome) in market.votes.iter() {
             let stake = market.stakes.get(user).unwrap_or(0);
             let current_total = outcome_totals.get(outcome.clone()).unwrap_or(0);
-            outcome_totals.set(outcome, current_total + stake);
-            total_votes += stake;
+            outcome_totals.set(outcome.clone(), current_total + stake);
+            total_stake += stake;
         }
 
+        // Find the leading outcome by total staked weight.
         let mut winning_outcome = String::from_str(env, "");
-        let mut max_stake = 0;
+        let mut max_stake: i128 = 0;
 
         for (outcome, stake) in outcome_totals.iter() {
             if stake > max_stake {
@@ -3401,8 +3412,9 @@ impl DisputeAnalytics {
             }
         }
 
-        let confidence = if total_votes > 0 {
-            (max_stake as i128) * 100 / total_votes
+        // Confidence = fraction of total stake behind the winning outcome.
+        let confidence: i128 = if total_stake > 0 {
+            (max_stake * 100) / total_stake
         } else {
             0
         };
@@ -3410,7 +3422,7 @@ impl DisputeAnalytics {
         CommunityConsensus {
             outcome: winning_outcome,
             confidence,
-            total_votes,
+            total_votes: total_stake,
         }
     }
 

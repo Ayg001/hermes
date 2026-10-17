@@ -1,6 +1,7 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 
-//! Markets contract with auth-gated entrypoints.
+//! Markets contract with auth-gated entrypoints and hardened security controls.
 //!
 //! Provides a prediction-market subsystem where every state-changing
 //! entrypoint enforces `require_auth` on the acting [`Address`].
@@ -48,12 +49,52 @@ pub enum DataKey {
     Bet(u32, Address),
     /// Whether the markets subsystem is globally paused (`true` = paused).
     Paused,
-    /// The admin / owner address.
+    /// The primary admin / owner address.
     Admin,
     /// Whether the contract has been initialized.
     Initialized,
     /// Liquidity provided by a user to a specific market.
     Liquidity(u32, Address),
+    /// Records that a winner has already claimed their payout for a market.
+    /// Written **before** any token transfer in `claim_winnings` to uphold the
+    /// checks-effects-interactions pattern and prevent reentrancy double-claims.
+    ClaimedBet(u32, Address),
+    /// Winning outcome indices recorded when a market is resolved.
+    WinningOutcomes(u32),
+
+    // ── Issue #007: Hardened Pause Keys ─────────────────────────────
+    /// Counter for generating unique pause proposal IDs.
+    PauseProposalCounter,
+    /// Pause proposal data keyed by proposal ID.
+    PauseProposal(u32),
+    /// Timelock delay in seconds required before executing a pause proposal.
+    PauseDelaySeconds,
+    /// Number of distinct admin approvals required to execute a pause proposal.
+    PauseRequiredApprovals,
+
+    // ── Issue #022: Bet Enumeration Keys ────────────────────────────
+    /// Ordered list of market IDs a user has placed bets on.
+    UserBetMarkets(Address),
+
+    // ── Issue #014: Payout Curve Keys ───────────────────────────────
+    /// Payout curve configuration for a market.
+    MarketPayoutCurve(u32),
+    /// Total wager pool for a market.
+    MarketTotalPool(u32),
+    /// Total wager pool for a specific outcome index within a market.
+    OutcomePool(u32, u32),
+
+    // ── Issue #012: Dust-Safe Balance & Fee Keys ────────────────────
+    /// Internal balance for a user.
+    UserBalance(Address),
+    /// Token contract used to fund user balances.
+    TokenAddress,
+    /// Minimum fee amount threshold in stroops.
+    MinFeeAmount,
+    /// Withdrawal fee in basis points (1 = 0.01%).
+    WithdrawalFeeBps,
+    /// Cumulative platform fees collected.
+    CollectedFees,
 }
 
 /// On-chain representation of a prediction market.
@@ -76,6 +117,8 @@ pub struct MarketData {
     pub resolved: bool,
     /// Index (0-based) of the winning outcome.
     pub winning_outcome: u32,
+    /// Whether the market has been cancelled.
+    pub cancelled: bool,
 }
 
 /// On-chain record of a user's bet on a market.
@@ -96,34 +139,203 @@ pub struct LiquidityData {
     pub total_amount: i128,
 }
 
+/// Pause proposal record for multi-step / timelocked pause operations (#007).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseProposal {
+    /// Sequential proposal identifier.
+    pub id: u32,
+    /// Admin address that created the proposal.
+    pub proposer: Address,
+    /// Reason or justification for the pause.
+    pub reason: String,
+    /// Ledger timestamp when the proposal was created.
+    pub created_at: u64,
+    /// Earliest ledger timestamp when the proposal may be executed.
+    pub eta: u64,
+    /// List of admin addresses that have approved the proposal.
+    pub approvals: Vec<Address>,
+    /// Whether the proposal has already been executed.
+    pub executed: bool,
+    /// Whether the proposal was cancelled.
+    pub cancelled: bool,
+}
+
+/// Contract-level query record for a user's bet (#022).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserBetInfo {
+    /// Numeric ID of the market.
+    pub market_id: u32,
+    /// Chosen outcome index (0-based).
+    pub outcome_index: u32,
+    /// Amount staked. Always positive — represented as unsigned to enforce the invariant at
+    /// the type level and avoid defensive negative-value handling by callers.
+    pub amount: u128,
+    /// Whether winnings for this bet have already been claimed.
+    pub claimed: bool,
+}
+
+/// Configurable payout curve configuration for distributing market pool funds (#014).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutCurveConfig {
+    /// 0 = WinnerTakesAll, 1 = Tiered, 2 = CustomWeights
+    pub curve_type: u32,
+    /// Outcome index receiving runner-up credit (for Tiered).
+    pub runner_up_outcome: u32,
+    /// Percentage in basis points awarded to runner-up (e.g. 2000 = 20%).
+    pub runner_up_bps: u32,
+    /// Custom basis point weights per outcome tag (for CustomWeights).
+    pub custom_weights: Vec<u32>,
+}
+
+impl PayoutCurveConfig {
+    pub const WINNER_TAKES_ALL: u32 = 0;
+    pub const TIERED: u32 = 1;
+    pub const CUSTOM_WEIGHTS: u32 = 2;
+
+    pub fn winner_takes_all(env: &Env) -> Self {
+        Self {
+            curve_type: Self::WINNER_TAKES_ALL,
+            runner_up_outcome: 0,
+            runner_up_bps: 0,
+            custom_weights: Vec::new(env),
+        }
+    }
+
+    pub fn tiered(env: &Env, runner_up_outcome: u32, runner_up_bps: u32) -> Self {
+        Self {
+            curve_type: Self::TIERED,
+            runner_up_outcome,
+            runner_up_bps,
+            custom_weights: Vec::new(env),
+        }
+    }
+
+    pub fn custom_weights(weights: Vec<u32>) -> Self {
+        Self {
+            curve_type: Self::CUSTOM_WEIGHTS,
+            runner_up_outcome: 0,
+            runner_up_bps: 0,
+            custom_weights: weights,
+        }
+    }
+}
+
+/// Result of a dust-safe user balance withdrawal (#012).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawalResult {
+    /// Net amount received by the user.
+    pub net_amount: i128,
+    /// Fee deducted (0 if dust waiver applied).
+    pub fee_deducted: i128,
+    /// Remaining balance in the contract.
+    pub remaining_balance: i128,
+}
+
 pub mod admin;
 
 #[contract]
 pub struct MarketsContract;
 
+impl MarketsContract {
+    // -----------------------------------------------------------------------
+    //  Internal Helpers
+    // -----------------------------------------------------------------------
+
+    fn is_admin_internal(env: &Env, caller: &Address) -> bool {
+        if let Some(admin) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::Admin)
+        {
+            if &admin == caller {
+                return true;
+            }
+        } else {
+            // First caller with admin action becomes initial admin if unset.
+            return true;
+        }
+
+        let admin_list: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AdminList)
+            .unwrap_or(Vec::new(env));
+        admin_list.contains(caller)
+    }
+
+    fn require_admin(env: &Env, caller: &Address) {
+        caller.require_auth();
+        if !Self::is_admin_internal(env, caller) {
+            panic_with_error!(env, ContractError::Unauthorized);
+        }
+    }
+
+    fn validate_payout_curve(env: &Env, curve: &PayoutCurveConfig, num_outcomes: u32) {
+        match curve.curve_type {
+            PayoutCurveConfig::WINNER_TAKES_ALL => {}
+            PayoutCurveConfig::TIERED => {
+                if curve.runner_up_outcome >= num_outcomes {
+                    panic_with_error!(env, ContractError::InvalidPayoutCurve);
+                }
+                if curve.runner_up_bps == 0 || curve.runner_up_bps >= 10_000 {
+                    panic_with_error!(env, ContractError::InvalidPayoutCurve);
+                }
+            }
+            PayoutCurveConfig::CUSTOM_WEIGHTS => {
+                if curve.custom_weights.len() != num_outcomes {
+                    panic_with_error!(env, ContractError::InvalidPayoutCurve);
+                }
+                let mut sum: u32 = 0;
+                for w in curve.custom_weights.iter() {
+                    sum = match sum.checked_add(w) {
+                        Some(s) => s,
+                        None => panic_with_error!(env, ContractError::InvalidPayoutCurve),
+                    };
+                }
+                if sum == 0 || sum > 10_000 {
+                    panic_with_error!(env, ContractError::InvalidPayoutCurve);
+                }
+            }
+            _ => panic_with_error!(env, ContractError::InvalidPayoutCurve),
+        }
+    }
+
+    fn winning_outcomes(env: &Env, market_id: u32, market: &MarketData) -> Vec<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WinningOutcomes(market_id))
+            .unwrap_or_else(|| {
+                let mut outcomes = Vec::new(env);
+                if market.resolved {
+                    outcomes.push_back(market.winning_outcome);
+                }
+                outcomes
+            })
+    }
+}
+
 #[contractimpl]
 impl MarketsContract {
     // -----------------------------------------------------------------------
-    //  Read-only
+    //  Read-only Entrypoints
     // -----------------------------------------------------------------------
 
     /// @notice Returns the contract version.
-    /// @dev This is a read-only introspection entrypoint that does **not** require authentication.
-    /// @param _env The contract environment.
-    /// @return The version number as u32.
     pub fn version(_env: Env) -> u32 {
         7
     }
 
     /// @notice Read a market from persistent storage and bump its TTL.
-    /// @param env The contract environment.
-    /// @param market_id The unique symbol identifying the market.
-    /// @return An optional value containing the market data if it exists.
     pub fn get_market(env: Env, market_id: soroban_sdk::Symbol) -> Option<soroban_sdk::Val> {
         let market: Option<soroban_sdk::Val> = env.storage().persistent().get(&market_id);
         if market.is_some() {
-            // Bump TTL: 365 days * 17280 ledgers per day = 6307200
-            env.storage().persistent().extend_ttl(&market_id, 6307200, 6307200);
+            env.storage()
+                .persistent()
+                .extend_ttl(&market_id, 6307200, 6307200);
         }
         market
     }

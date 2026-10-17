@@ -1,0 +1,6 @@
+commit_out.txt
+
+# Rust build artifacts
+target/
+*.rs.bk
+/contracts/oracles/test_snapshots/
