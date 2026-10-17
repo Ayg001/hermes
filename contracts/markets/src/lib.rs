@@ -179,8 +179,9 @@ pub struct UserBetInfo {
     pub market_id: u32,
     /// Chosen outcome index (0-based).
     pub outcome_index: u32,
-    /// Amount staked.
-    pub amount: i128,
+    /// Amount staked. Always positive — represented as unsigned to enforce the invariant at
+    /// the type level and avoid defensive negative-value handling by callers.
+    pub amount: u128,
     /// Whether winnings for this bet have already been claimed.
     pub claimed: bool,
 }
@@ -1052,10 +1053,11 @@ impl MarketsContract {
                     .get(&DataKey::ClaimedBet(market_id, user.clone()))
                     .unwrap_or(false);
 
+                // bet.amount is validated > 0 in place_bet, so the cast to u128 is safe.
                 results.push_back(UserBetInfo {
                     market_id,
                     outcome_index: bet.outcome_index,
-                    amount: bet.amount,
+                    amount: bet.amount as u128,
                     claimed,
                 });
             }
