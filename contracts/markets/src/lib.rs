@@ -14,7 +14,7 @@
 //! | `create_market_with_curve`  | Creator (any address)      |
 //! | `set_market_payout_curve`   | Market creator or Admin    |
 //! | `place_bet`                 | Bettor (any address)       |
-//! | `resolve_market`            | Market creator             |
+//! | `resolve_market`            | Market creator or Admin    |
 //! | `claim_winnings`            | Winner / Claimant (bettor) |
 //! | `cancel_market`             | Market creator             |
 //! | `withdraw_funds`            | Market creator             |
@@ -616,6 +616,8 @@ impl MarketsContract {
     }
 
     /// Resolves a market by recording the winning outcome.
+    ///
+    /// Only the market creator or a platform admin may resolve a market.
     pub fn resolve_market(env: Env, resolver: Address, market_id: u32, winning_outcome: u32) {
         resolver.require_auth();
 
@@ -624,6 +626,11 @@ impl MarketsContract {
                 Some(m) => m,
                 None => panic_with_error!(env, ContractError::MarketNotFound),
             };
+
+        // Role check: resolver must be the market creator or a platform admin.
+        if resolver != market.creator && !Self::is_admin_internal(&env, &resolver) {
+            panic_with_error!(env, ContractError::Unauthorized);
+        }
 
         if market.resolved {
             panic_with_error!(env, ContractError::MarketAlreadyResolved);
