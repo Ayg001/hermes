@@ -27,6 +27,7 @@
 //! | `approve_pause`             | Admin                      |
 //! | `execute_pause`             | Admin                      |
 //! | `cancel_pause`              | Admin                      |
+//! | `get_pause_proposal`        | Admin                      |
 //! | `set_pause_config`          | Admin                      |
 //! | `add_admin`                 | Admin                      |
 //! | `transfer_ownership`        | Admin                      |
@@ -1438,8 +1439,9 @@ impl MarketsContract {
             .set(&DataKey::PauseProposal(proposal_id), &proposal);
     }
 
-    /// Reads a pause proposal by ID (#007).
-    pub fn get_pause_proposal(env: Env, proposal_id: u32) -> Option<PauseProposal> {
+    /// Reads a pause proposal by ID. Only administrators may view proposal details (#007).
+    pub fn get_pause_proposal(env: Env, admin: Address, proposal_id: u32) -> Option<PauseProposal> {
+        Self::require_admin(&env, &admin);
         env.storage()
             .persistent()
             .get(&DataKey::PauseProposal(proposal_id))

@@ -125,7 +125,10 @@ fn test_hardened_pause_full_proposal_lifecycle() {
     let proposal_id = te.client.propose_pause(&te.admin1, &reason);
     assert_eq!(proposal_id, 1);
 
-    let proposal = te.client.get_pause_proposal(&proposal_id).unwrap();
+    let proposal = te
+        .client
+        .get_pause_proposal(&te.admin1, &proposal_id)
+        .unwrap();
     assert_eq!(proposal.approvals.len(), 1);
     assert!(!proposal.executed);
 
@@ -145,7 +148,10 @@ fn test_hardened_pause_full_proposal_lifecycle() {
 
     // 4. Second admin approves
     te.client.approve_pause(&te.admin2, &proposal_id);
-    let proposal_after_app = te.client.get_pause_proposal(&proposal_id).unwrap();
+    let proposal_after_app = te
+        .client
+        .get_pause_proposal(&te.admin1, &proposal_id)
+        .unwrap();
     assert_eq!(proposal_after_app.approvals.len(), 2);
 
     // 5. Cannot execute before timelock expiry (now < eta)
@@ -174,6 +180,24 @@ fn test_hardened_pause_full_proposal_lifecycle() {
     // 9. Admin unpause restores operations
     te.client.unpause_markets(&te.admin1);
     assert!(!te.client.is_paused());
+}
+
+#[test]
+fn test_pause_proposal_read_requires_admin() {
+    let te = setup_test_env();
+    let reason = String::from_str(&te.env, "Emergency security investigation");
+    let proposal_id = te.client.propose_pause(&te.admin1, &reason);
+
+    let unauthorized = te.client.try_get_pause_proposal(&te.bettor1, &proposal_id);
+    assert_eq!(
+        unauthorized.unwrap_err().unwrap(),
+        ContractError::Unauthorized.into()
+    );
+
+    assert!(te
+        .client
+        .get_pause_proposal(&te.admin1, &proposal_id)
+        .is_some());
 }
 
 #[test]
