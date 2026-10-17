@@ -39,6 +39,7 @@ error_code_snapshot! {
     BetsAlreadyPlaced = 111,
     InsufficientBalance = 112,
     BetCoolOffActive = 113,
+    BetCancellationWindowClosed = 114,
 
     OracleUnavailable = 200,
     InvalidOracleConfig = 201,
@@ -55,6 +56,7 @@ error_code_snapshot! {
     OracleCallbackInvalidSignature = 212,
     OracleCallbackReplayDetected = 213,
     OracleCallbackTimeout = 214,
+    InvalidOracleProvider = 215,
 
     InvalidQuestion = 300,
     InvalidOutcomes = 301,
@@ -145,6 +147,16 @@ error_code_snapshot! {
     UserNotWhitelisted = 541,
     CreatorBlacklisted = 542,
 
+    DelegationNotFound = 550,
+    DelegationSelfDelegation = 551,
+    DelegationCircular = 552,
+    DelegationAlreadyExists = 553,
+    DelegationMaxExceeded = 554,
+    DelegationCooldownActive = 555,
+    DelegationUnauthorized = 556,
+    DelegationExpired = 557,
+    DelegationInvalidParams = 558,
+
     ReasonTableFull = 670,
     Overflow = 672,
     MaxBetCapExceeded = 673,
@@ -154,7 +166,7 @@ error_code_snapshot! {
 
 #[test]
 fn contract_error_codes_are_stable() {
-    assert_eq!(ERROR_CODE_SNAPSHOT.len(), 120);
+    assert_eq!(ERROR_CODE_SNAPSHOT.len(), 131);
 
     for &(error, expected) in ERROR_CODE_SNAPSHOT {
         assert_eq!(

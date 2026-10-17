@@ -34,6 +34,7 @@ fn setup_test() -> (Env, TestSetup) {
         user1,
         user2,
         user3,
+        contract_id,
         client,
     };
 
@@ -48,6 +49,7 @@ struct TestSetup {
     user1: Address,
     user2: Address,
     user3: Address,
+    contract_id: Address,
     client: AllowlistContractClient,
 }
 
@@ -383,6 +385,27 @@ fn test_new_admin_can_manage_allowlists() {
 fn test_version() {
     let (_env, setup) = setup_test();
     assert_eq!(setup.client.version(), 1);
+}
+
+#[test]
+fn test_entrypoint_bumps_instance_ttl() {
+    let (env, setup) = setup_test();
+    env.ledger().set(LedgerInfo {
+        timestamp: 1735689600,
+        protocol_version: 20,
+        sequence_number: 450_000,
+        network_id: [0; 32],
+        base_reserve: 10,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+        max_entry_ttl: 518_400,
+    });
+
+    let ttl_before = env.as_contract(&setup.contract_id, || env.storage().instance().get_ttl());
+    assert!(ttl_before < 518_400);
+    assert_eq!(setup.client.get_admin(), setup.admin);
+    let ttl_after = env.as_contract(&setup.contract_id, || env.storage().instance().get_ttl());
+    assert_eq!(ttl_after, 518_400);
 }
 
 #[test]

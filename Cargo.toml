@@ -1,16 +1,25 @@
+# Workspace configuration with consistent WASM optimization
+# All contracts use the release profile below for production builds
+# Additional configuration in .cargo/config.toml ensures cross-target consistency
+
 [workspace]
 resolver = "2"
 members = [
+  "crates/hermes-errors",
+  "crates/hermes-codegen",
   "contracts/*",
   "contracts/predictify-hybrid/fuzz",
   "contracts/disputes/fuzz",
   "contracts/resolution/fuzz",
+  "contracts/auction",
+  "contracts/analytics",
 ]
 exclude = []
 
 [workspace.dependencies]
-soroban-sdk = "25.0.0"
+soroban-sdk = "22.0.0"
 ethnum = "1.5.3"
+criterion = "0.5"
 
 [profile.release]
 opt-level = "z"
@@ -26,5 +35,6 @@ lto = true
 [profile.release-with-logs]
 inherits = "release"
 debug-assertions = true
+
 
 

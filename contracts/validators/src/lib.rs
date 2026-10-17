@@ -20,6 +20,8 @@
 //! | `initialize`            | Admin (caller)          |
 //! | `register_validator`    | Validator (self)        |
 //! | `deregister_validator`  | Validator (self)        |
+//! | `start_resolution_round`| Admin                   |
+//! | `end_resolution_round`  | Admin                   |
 //! | `update_stake`          | Validator (self)        |
 //! | `set_validator_active`  | Admin                   |
 //! | `update_score`          | Admin                   |
@@ -219,7 +221,9 @@ impl ValidatorsContract {
     /// 2. Ensures the contract is initialized and not paused.
     /// 3. Panics with [`ValidatorError::ValidatorNotFound`] if the address is
     ///    unknown.
-    /// 4. Removes the persistent record and decrements `ValidatorCount`.
+    /// 4. Rejects deregistration if the validator is in an active resolution
+    ///    round.
+    /// 5. Removes the persistent record and decrements `ValidatorCount`.
     ///
     /// # Why auth is required
     /// Without auth, any account could remove a validator's registration,
@@ -232,6 +236,8 @@ impl ValidatorsContract {
     /// * [`ValidatorError::NotInitialized`]    — contract not yet initialized.
     /// * [`ValidatorError::ValidatorsPaused`]  — subsystem is paused.
     /// * [`ValidatorError::ValidatorNotFound`] — address is not registered.
+    /// * [`ValidatorError::ValidatorInActiveRound`] — validator is participating
+    ///   in an active resolution round.
     pub fn deregister_validator(env: Env, validator: Address) -> Result<(), ValidatorError> {
         validator.require_auth();
 
@@ -241,6 +247,9 @@ impl ValidatorsContract {
         let key = DataKey::Validator(validator);
         if !env.storage().persistent().has(&key) {
             return Err(ValidatorError::ValidatorNotFound);
+        }
+        if Self::has_active_round(&env, &validator) {
+            return Err(ValidatorError::ValidatorInActiveRound);
         }
 
         env.storage().persistent().remove(&key);
@@ -254,6 +263,62 @@ impl ValidatorsContract {
             .persistent()
             .set(&DataKey::ValidatorCount, &count.saturating_sub(1));
 
+        Ok(())
+    }
+
+    /// Mark `validator` as participating in an active resolution round.
+    ///
+    /// The resolution orchestrator must call this when a validator enters a
+    /// round, and call [`Self::end_resolution_round`] when that round concludes.
+    /// Only the validator contract admin may update this lifecycle flag.
+    ///
+    /// # Errors
+    /// * [`ValidatorError::NotInitialized`] — contract not yet initialized.
+    /// * [`ValidatorError::Unauthorized`] — caller is not the contract admin.
+    /// * [`ValidatorError::ValidatorNotFound`] — `validator` is not registered.
+    pub fn start_resolution_round(
+        env: Env,
+        admin: Address,
+        validator: Address,
+    ) -> Result<(), ValidatorError> {
+        admin.require_auth();
+
+        Self::assert_initialized(&env)?;
+        Self::assert_is_admin(&env, &admin)?;
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Validator(validator.clone()))
+        {
+            return Err(ValidatorError::ValidatorNotFound);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveRound(validator), &true);
+        Ok(())
+    }
+
+    /// Clear `validator`'s active-round flag after the resolution round concludes.
+    ///
+    /// This remains available while validators are paused so a completed round
+    /// can always release its participants.
+    ///
+    /// # Errors
+    /// * [`ValidatorError::NotInitialized`] — contract not yet initialized.
+    /// * [`ValidatorError::Unauthorized`] — caller is not the contract admin.
+    pub fn end_resolution_round(
+        env: Env,
+        admin: Address,
+        validator: Address,
+    ) -> Result<(), ValidatorError> {
+        admin.require_auth();
+
+        Self::assert_initialized(&env)?;
+        Self::assert_is_admin(&env, &admin)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ActiveRound(validator));
         Ok(())
     }
 
@@ -644,6 +709,20 @@ impl ValidatorsContract {
         env.storage()
             .persistent()
             .has(&DataKey::Validator(validator))
+    }
+
+    /// Return whether `validator` is currently participating in a resolution round.
+    ///
+    /// Returns `false` if the validator has no active-round flag.
+    pub fn is_validator_in_active_round(env: Env, validator: Address) -> bool {
+        Self::has_active_round(&env, &validator)
+    }
+
+    fn has_active_round(env: &Env, validator: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ActiveRound(validator.clone()))
+            .unwrap_or(false)
     }
 
     /// Return the total number of currently registered validators.

@@ -156,7 +156,7 @@ pub enum MarketState {
 /// The provider is stored as a string identifier rather than an enum variant, enabling:
 /// - **Future Provider Addition**: New providers can be added without breaking existing markets
 /// - **Backward Compatibility**: Existing markets continue to work with older contract versions
-/// - **Graceful Degradation**: Unknown providers are handled safely with fallback behavior
+/// - **Unknown Provider Rejection**: Unknown identifiers never alias a supported provider
 ///
 /// # Provider Identifiers
 ///
@@ -181,7 +181,7 @@ pub enum MarketState {
 /// // Create provider instances
 /// let reflector = OracleProvider::reflector();
 /// let pyth = OracleProvider::pyth();
-/// let custom = OracleProvider::from_str(String::from_str(&env, "new_provider"));
+/// let custom = OracleProvider::from_str(&env, String::from_str(&env, "new_provider"));
 ///
 /// // Check support status
 /// assert!(reflector.is_supported());
@@ -191,7 +191,8 @@ pub enum MarketState {
 /// // Get provider identifier
 /// assert_eq!(reflector.as_str(), "reflector");
 /// assert_eq!(pyth.as_str(), "pyth");
-/// assert_eq!(custom.as_str(), "new_provider");
+/// assert_eq!(custom.as_str(), "unknown");
+/// assert!(!custom.is_known());
 ///
 /// // Convert to string for display
 /// println!("Provider: {}", reflector.name());
@@ -210,7 +211,7 @@ pub enum MarketState {
 /// if provider.is_supported() {
 ///     println!("Provider {} is supported", provider.name());
 /// } else {
-///     println!("Provider {} not supported - using fallback", provider.name());
+///     println!("Provider {} is not supported", provider.name());
 /// }
 ///
 /// // Check if provider is known (even if unsupported)
@@ -251,6 +252,7 @@ pub enum OracleProvider {
     Pyth,
     BandProtocol,
     DIA,
+    Unknown,
 }
 
 impl OracleProvider {
@@ -344,9 +346,8 @@ impl OracleProvider {
 
     /// Creates an OracleProvider from a string identifier.
     ///
-    /// This constructor enables forward compatibility by allowing any string
-    /// to be used as a provider identifier. Unknown providers are handled
-    /// gracefully through the `is_supported()` and `is_known()` methods.
+    /// This constructor recognizes registered provider identifiers and maps
+    /// unrecognized identifiers to an explicit marker that fails validation.
     ///
     /// # Arguments
     ///
@@ -354,7 +355,7 @@ impl OracleProvider {
     ///
     /// # Returns
     ///
-    /// `OracleProvider` instance with the specified identifier
+    /// `OracleProvider` instance for a recognized identifier, or `Unknown`
     ///
     /// # Example
     ///
@@ -381,7 +382,7 @@ impl OracleProvider {
         } else if provider_id == String::from_str(env, "dia") {
             OracleProvider::DIA
         } else {
-            OracleProvider::Reflector // Default
+            OracleProvider::Unknown
         }
     }
 
@@ -391,6 +392,7 @@ impl OracleProvider {
             OracleProvider::Pyth => "pyth",
             OracleProvider::BandProtocol => "band_protocol",
             OracleProvider::DIA => "dia",
+            OracleProvider::Unknown => "unknown",
         }
     }
 
@@ -456,7 +458,7 @@ impl OracleProvider {
     /// assert!(pyth.is_known()); // Known but unsupported
     /// ```
     pub fn is_known(&self) -> bool {
-        true
+        !matches!(self, OracleProvider::Unknown)
     }
 
     /// Checks if this oracle provider is supported on the current network.
@@ -524,7 +526,7 @@ impl OracleProvider {
     /// # Returns
     ///
     /// `Ok(())` if the provider is valid for market creation
-    /// `Err(Error::InvalidOracleConfig)` if validation fails
+    /// `Err(Error::InvalidOracleProvider)` if validation fails
     ///
     /// # Example
     ///
@@ -541,7 +543,7 @@ impl OracleProvider {
     /// ```
     pub fn validate_for_market(&self, _env: &soroban_sdk::Env) -> Result<(), crate::Error> {
         if !self.is_supported() {
-            return Err(crate::Error::InvalidOracleConfig);
+            return Err(crate::Error::InvalidOracleProvider);
         }
         Ok(())
     }
@@ -700,10 +702,11 @@ impl OracleProvider {
 /// # Error Handling
 ///
 /// Common configuration errors:
+/// - **InvalidOracleConfig**: Configuration is the reserved "no oracle" sentinel
+/// - **InvalidOracleProvider**: Unsupported oracle provider
+/// - **InvalidOracleFeed**: Empty feed identifier or feed format incompatible with the provider
 /// - **InvalidThreshold**: Threshold is zero or negative
 /// - **InvalidComparison**: Unsupported comparison operator
-/// - **InvalidOracleConfig**: Unsupported oracle provider
-/// - **InvalidFeed**: Empty or malformed feed identifier
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OracleConfig {
@@ -777,9 +780,12 @@ impl OracleConfig {
 impl OracleConfig {
     /// Validate the oracle configuration
     pub fn validate(&self, env: &Env) -> Result<(), crate::Error> {
-        // Reject empty/sentinel config
-        if self.is_none_sentinel() || self.feed_id.is_empty() {
+        if self.is_none_sentinel() {
             return Err(crate::Error::InvalidOracleConfig);
+        }
+
+        if self.feed_id.is_empty() {
+            return Err(crate::Error::InvalidOracleFeed);
         }
 
         crate::metadata_limits::validate_feed_id_length(&self.feed_id)?;
@@ -806,21 +812,24 @@ impl OracleConfig {
             // Reflector uses short asset symbols like "BTC/USD" or "XLM"
             // Hex strings of 64+ chars are Pyth feeds and impossible for Reflector
             if feed_id_len >= 64 {
-                return Err(crate::Error::InvalidOracleConfig);
+                return Err(crate::Error::InvalidOracleFeed);
             }
         } else if provider_str == "pyth" {
             // Pyth uses 64-char hex strings (sometimes 66 with 0x)
             if feed_id_len < 64 || feed_id_len > 66 {
-                return Err(crate::Error::InvalidOracleConfig);
+                return Err(crate::Error::InvalidOracleFeed);
             }
         } else if provider_str == "band_protocol" || provider_str == "dia" {
             if feed_id_len >= 64 {
-                return Err(crate::Error::InvalidOracleConfig);
+                return Err(crate::Error::InvalidOracleFeed);
             }
         }
 
         // Validate provider is supported using new validation method
         self.provider.validate_for_market(env)?;
+
+        // Enforce authorized oracle address validation
+        crate::oracles::OracleRegistry::require_oracle_allowed(env, &self.oracle_address)?;
 
         Ok(())
     }
@@ -1663,7 +1672,7 @@ impl Market {
         // FIX: only validate fallback if it's actually provided (not sentinel)
         if self.has_fallback && !self.fallback_oracle_config.is_none_sentinel() {
             if self.fallback_oracle_config.feed_id.is_empty() {
-                return Err(crate::Error::InvalidOracleConfig);
+                return Err(crate::Error::InvalidOracleFeed);
             }
 
             self.fallback_oracle_config.validate(env)?;
@@ -3015,7 +3024,8 @@ pub struct ExtensionStats {
 ///         // - InvalidOutcomes: Less than 2 outcomes or duplicates
 ///         // - InvalidDuration: Duration too short or too long
 ///         // - InsufficientFee: Creation fee below minimum
-///         // - InvalidOracleConfig: Oracle configuration errors
+///         // - InvalidOracleProvider / InvalidOracleFeed / InvalidThreshold /
+///         //   InvalidComparison: Oracle configuration errors
 ///     }
 /// }
 /// ```
@@ -3868,7 +3878,7 @@ pub enum BetStatus {
 /// Before a bet is placed, the following validations occur:
 /// - Market exists and is in Active state
 /// - Market has not ended (current time < end_time)
-/// - User has not already placed a bet on this market
+/// - An active bet is replaced; a resolved bet cannot be replaced
 /// - User has sufficient balance for the bet amount
 /// - Bet amount meets minimum stake requirements
 /// - Selected outcome is valid for the market
@@ -4138,8 +4148,7 @@ impl ReflectorAsset {
     /// Validates the asset for use in market creation
     pub fn validate_for_market(&self, _env: &soroban_sdk::Env) -> Result<(), crate::Error> {
         if !self.is_supported() {
-            // Allow unknown providers ONLY if fallback is disabled
-            return Err(Error::InvalidOracleConfig);
+            return Err(Error::InvalidOracleFeed);
         }
         Ok(())
     }
@@ -4239,10 +4248,7 @@ mod tests {
             MarketState::Active,
         );
 
-        assert_eq!(
-            market.validate(&env),
-            Err(crate::Error::InvalidOracleConfig)
-        );
+        assert_eq!(market.validate(&env), Err(crate::Error::InvalidOracleFeed));
     }
 
     #[test]

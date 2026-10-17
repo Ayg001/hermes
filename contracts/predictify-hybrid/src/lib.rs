@@ -24,12 +24,12 @@ mod batch_operations;
 mod bets;
 pub mod circuit_breaker;
 mod config;
+mod delegation;
 mod err;
 mod force_resolve;
 mod event_archive;
 pub mod events;
 mod extensions;
-mod events;
 pub mod gov_registry;
 mod fees;
 mod gas;
@@ -70,26 +70,23 @@ mod utils;
 mod validation;
 mod versioning;
 mod voting;
+mod voting_delegation_integration;
 mod market_analytics;
 mod performance_benchmarks;
 mod disputes;
 mod edge_cases;
-mod extensions;
 mod graceful_degradation;
 mod market_id_generator;
 mod metadata_limits;
 mod queries;
 mod recovery;
 mod statistics;
-mod tokens;
 mod rate_limiter;
 mod dispute_multisig;
 mod event_topic_catalog;
 mod storage_tier_audit;
 mod leaderboard;
 mod lists;
-mod audit_trail;
-mod monitor;
 mod capabilities;
 
 #[cfg(test)]
@@ -327,6 +324,10 @@ impl PredictifyHybrid {
             }
         }
 
+        if let Err(e) = crate::markets::MarketValidator::validate_unique_outcomes(&outcomes) {
+            panic_with_error!(env, e);
+        }
+
         if let Err(e) = crate::validation::CreationValidator::validate_market_creation(&env, &question, &outcomes, &duration_days) {
             panic_with_error!(env, e);
         }
@@ -403,6 +404,7 @@ impl PredictifyHybrid {
         }
 
         env.storage().persistent().set(&market_id, &market);
+        markets::MarketReadCache::new(&env).invalidate(&market_id);
         env.storage().persistent().extend_ttl(&market_id, MARKET_TTL_LEDGERS, MARKET_TTL_LEDGERS);
 
         crate::events::EventEmitter::emit_market_created(&env, &market_id, &question, &outcomes, &admin, end_time);
@@ -739,6 +741,7 @@ impl PredictifyHybrid {
         // Mark this market as swept so a second call returns SweepAlreadyDone.
         market.winnings_swept = true;
         env.storage().persistent().set(&market_id, &market);
+        markets::MarketReadCache::new(&env).invalidate(&market_id);
         EventEmitter::emit_unclaimed_winnings_swept(
             &env,
             &market_id,
@@ -803,7 +806,7 @@ impl PredictifyHybrid {
     /// # Performance
     ///
     /// This is a read-only operation that doesn't modify contract state.
-    /// It retrieves data from persistent storage with minimal computational overhead.
+    /// It retrieves data from the instance cache when available, falling back to persistent storage.
     ///
     /// # Errors
     ///
@@ -813,7 +816,7 @@ impl PredictifyHybrid {
     ///
     /// State-changing paths may emit events through internal managers; read-only query paths emit no events.
     pub fn get_market(env: Env, market_id: Symbol) -> Option<Market> {
-        env.storage().persistent().get(&market_id)
+        markets::MarketStateManager::get_market(&env, &market_id).ok()
     }
 
     /// Verifies a client's expected metadata commitment against on-chain market metadata.
@@ -823,10 +826,9 @@ impl PredictifyHybrid {
     /// match the commitment stored at creation/update time, or when any committed field
     /// in storage was changed without refreshing the stored commitment.
     pub fn verify_market_metadata(env: Env, market_id: Symbol, expected: BytesN<32>) -> bool {
-        let market: Option<Market> = env.storage().persistent().get(&market_id);
-        match market {
-            Some(market) => market.verify_metadata_commitment(&env, &expected),
-            None => false,
+        match markets::MarketStateManager::get_market(&env, &market_id) {
+            Ok(market) => market.verify_metadata_commitment(&env, &expected),
+            Err(_) => false,
         }
     }
 
@@ -967,6 +969,7 @@ impl PredictifyHybrid {
             env.ledger().timestamp(),
         );
         env.storage().persistent().set(&market_id, &market);
+        markets::MarketReadCache::new(&env).invalidate(&market_id);
 
         // Resolve bets to mark them as won/lost
         let _ = bets::BetManager::resolve_market_bets(&env, &market_id, &winning_outcomes_vec);
@@ -1138,6 +1141,7 @@ impl PredictifyHybrid {
             env.ledger().timestamp(),
         );
         env.storage().persistent().set(&market_id, &market);
+        markets::MarketReadCache::new(&env).invalidate(&market_id);
 
         // Resolve bets to mark them as won/lost
         let _ = bets::BetManager::resolve_market_bets(&env, &market_id, &winning_outcomes);
@@ -1283,6 +1287,7 @@ impl PredictifyHybrid {
         );
 
         env.storage().persistent().set(&market_id, &market);
+        markets::MarketReadCache::new(&env).invalidate(&market_id);
 
         force_resolve::ForceResolveManager::mark_resolved(
             &env,
@@ -1467,6 +1472,7 @@ impl PredictifyHybrid {
             Ok(outcome) => {
                 market.oracle_result = Some(outcome.clone());
                 env.storage().persistent().set(&market_id, &market);
+                markets::MarketReadCache::new(&env).invalidate(&market_id);
                 Ok(outcome)
             }
             Err(_) if market.has_fallback => {
@@ -1474,6 +1480,7 @@ impl PredictifyHybrid {
                     Ok(outcome) => {
                         market.oracle_result = Some(outcome.clone());
                         env.storage().persistent().set(&market_id, &market);
+                        markets::MarketReadCache::new(&env).invalidate(&market_id);
                         EventEmitter::emit_fallback_used(
                             &env,
                             &market_id,
@@ -1828,6 +1835,28 @@ impl PredictifyHybrid {
     /// Get configured weight for an oracle source, defaults to 1
     pub fn get_oracle_weight(env: Env, oracle: Address) -> u32 {
         crate::oracles::OracleIntegrationManager::get_oracle_weight(&env, &oracle)
+    }
+
+    /// Register an authorized oracle contract address (admin only).
+    pub fn add_allowed_oracle(env: Env, admin: Address, oracle: Address) -> Result<(), Error> {
+        Self::require_primary_admin(&env, &admin)?;
+        crate::oracles::OracleIntegrationManager::add_allowed_oracle(&env, &admin, &oracle)
+    }
+
+    /// Remove an oracle contract address from the authorized allowlist (admin only).
+    pub fn remove_allowed_oracle(env: Env, admin: Address, oracle: Address) -> Result<(), Error> {
+        Self::require_primary_admin(&env, &admin)?;
+        crate::oracles::OracleIntegrationManager::remove_allowed_oracle(&env, &admin, &oracle)
+    }
+
+    /// List all registered and authorized oracle contract addresses.
+    pub fn list_allowed_oracles(env: Env) -> Vec<Address> {
+        crate::oracles::OracleIntegrationManager::list_allowed_oracles(&env)
+    }
+
+    /// Check if a given oracle contract address is authorized.
+    pub fn is_oracle_allowed(env: Env, oracle: Address) -> bool {
+        crate::oracles::OracleIntegrationManager::is_oracle_allowed(&env, &oracle)
     }
 
     pub fn admin_override_verification(
@@ -2937,6 +2966,7 @@ impl PredictifyHybrid {
 
         // ── Persist updated claim map ──────────────────────────────────────────
         env.storage().persistent().set(&market_id, &market);
+        markets::MarketReadCache::new(&env).invalidate(&market_id);
 
         Ok(total_distributed)
     }
@@ -3111,9 +3141,40 @@ impl PredictifyHybrid {
         fees::FeeManager::commit_fee_config(&env, admin, hash)
     }
 
-    /// Reveal and apply a committed fee configuration (admin only)
+    /// Reveal and queue a committed fee configuration with timelock (admin only).
     pub fn reveal_fee_config(env: Env, admin: Address, new_config: fees::FeeConfig) -> Result<fees::FeeConfig, Error> {
         fees::FeeManager::update_fee_config(&env, admin, new_config)
+    }
+
+    /// Returns the active pending fee commitment (hash, committer, timestamp), if any.
+    ///
+    /// Read-only — no authentication required.
+    pub fn get_pending_fee_commit(env: Env) -> Option<fees::PendingFeeCommit> {
+        fees::FeeManager::get_pending_fee_commit(&env)
+    }
+
+    /// Returns the in-flight/queued pending fee configuration awaiting execution, if any.
+    ///
+    /// Read-only — no authentication required.
+    pub fn get_pending_fee_config(env: Env) -> Option<fees::PendingFeeConfig> {
+        fees::FeeManager::get_pending_fee_config(&env)
+    }
+
+    /// Returns the currently active fee configuration.
+    ///
+    /// Read-only — no authentication required.
+    pub fn get_fee_config(env: Env) -> Result<fees::FeeConfig, Error> {
+        fees::FeeConfigManager::get_fee_config(&env)
+    }
+
+    /// Apply a previously queued fee configuration update after its timelock has expired.
+    pub fn apply_fee_update(env: Env, admin: Address) -> Result<(), Error> {
+        fees::FeeManager::apply_fee_update(&env, admin)
+    }
+
+    /// Cancel an active fee commitment or queued fee configuration update.
+    pub fn cancel_fee_update(env: Env, admin: Address) -> Result<(), Error> {
+        fees::FeeManager::cancel_fee_update(&env, admin)
     }
 
     /// Set global minimum and maximum bet limits (admin only).
@@ -3185,6 +3246,62 @@ impl PredictifyHybrid {
     /// State-changing paths may emit events through internal managers; read-only query paths emit no events.
     pub fn get_effective_bet_limits(env: Env, market_id: Symbol) -> BetLimits {
         crate::bets::get_effective_bet_limits(&env, &market_id)
+    }
+
+    /// Set the global bet-cancellation window in seconds (admin only).
+    ///
+    /// A bettor may cancel a still-open bet only within this many seconds of
+    /// placing it. Shorter windows protect market liquidity; the value is
+    /// bounded by `crate::bets::MAX_BET_CANCEL_WINDOW_SECONDS`.
+    ///
+    /// # Parameters
+    ///
+    /// - `admin`   – Must be the primary admin address
+    /// - `seconds` – New cancellation window in seconds
+    ///
+    /// # Errors
+    ///
+    /// - `Error::Unauthorized` when `admin` is not the primary admin
+    /// - `Error::InvalidInput` when `seconds` is zero or above the maximum
+    ///
+    /// # Events
+    ///
+    /// Emits a `bet_cancel_window_set` event so indexers can track the change.
+    pub fn set_bet_cancel_window(
+        env: Env,
+        admin: Address,
+        seconds: u64,
+    ) -> Result<(), Error> {
+        Self::require_primary_admin(&env, &admin)?;
+        crate::bets::set_bet_cancel_window(&env, seconds)?;
+        EventEmitter::emit_bet_cancel_window_set(&env, &admin, seconds);
+        Ok(())
+    }
+
+    /// Get the effective global bet-cancellation window in seconds.
+    ///
+    /// # Events
+    ///
+    /// Read-only query paths emit no events.
+    pub fn get_bet_cancel_window(env: Env) -> u64 {
+        crate::bets::get_bet_cancel_window(&env)
+    }
+
+    /// Cancel a still-open bet within the configured cancellation window and
+    /// refund the bettor in full (bettor only).
+    ///
+    /// # Errors
+    ///
+    /// - `Error::NothingToClaim` when the caller has no bet on the market
+    /// - `Error::InvalidState` when the bet is not `Active`
+    /// - `Error::MarketClosed` when the market has already ended
+    /// - `Error::BetCancellationWindowClosed` when the cancellation window has elapsed
+    ///
+    /// # Events
+    ///
+    /// Emits `bet_cancelled` (and the generic `bet_status_updated`).
+    pub fn cancel_bet(env: Env, user: Address, market_id: Symbol) -> Result<(), Error> {
+        crate::bets::BetManager::cancel_bet(&env, user, market_id)
     }
 
     /// Set the per-market maximum single-bet cap (admin only).
@@ -3285,6 +3402,7 @@ impl PredictifyHybrid {
             .unwrap_or_else(|| panic_with_error!(&env, Error::MarketNotFound));
         market.max_participants = max_participants;
         env.storage().persistent().set(&market_id, &market);
+        markets::MarketReadCache::new(&env).invalidate(&market_id);
         Ok(())
     }
 
@@ -3692,6 +3810,7 @@ impl PredictifyHybrid {
 
         // Save market
         env.storage().persistent().set(&market_id, &market);
+        markets::MarketReadCache::new(&env).invalidate(&market_id);
 
         // Emit description update event
         EventEmitter::emit_market_description_updated(
@@ -3844,6 +3963,7 @@ impl PredictifyHybrid {
 
         // Save market
         env.storage().persistent().set(&market_id, &market);
+        markets::MarketReadCache::new(&env).invalidate(&market_id);
 
         // Emit outcomes update event
         EventEmitter::emit_market_outcomes_updated(
@@ -3964,6 +4084,7 @@ impl PredictifyHybrid {
 
         // Save market
         env.storage().persistent().set(&market_id, &market);
+        markets::MarketReadCache::new(&env).invalidate(&market_id);
 
         // Emit category update event
         EventEmitter::emit_category_updated(&env, &market_id, &old_category, &category, &admin);
@@ -4086,6 +4207,7 @@ impl PredictifyHybrid {
 
         // Save market
         env.storage().persistent().set(&market_id, &market);
+        markets::MarketReadCache::new(&env).invalidate(&market_id);
 
         // Emit tags update event
         EventEmitter::emit_tags_updated(&env, &market_id, &old_tags, &tags, &admin);
@@ -4341,6 +4463,7 @@ impl PredictifyHybrid {
         // Update market state to cancelled
         market.state = MarketState::Cancelled;
         env.storage().persistent().set(&market_id, &market);
+        markets::MarketReadCache::new(&env).invalidate(&market_id);
 
         // Refund all bets (batch of token transfers)
         let refund_result = bets::BetManager::refund_market_bets(&env, &market_id);
@@ -4431,6 +4554,7 @@ impl PredictifyHybrid {
         let old_state = market.state.clone();
         market.state = MarketState::Cancelled;
         env.storage().persistent().set(&market_id, &market);
+        markets::MarketReadCache::new(&env).invalidate(&market_id);
 
         let refund_result = bets::BetManager::refund_market_bets(&env, &market_id);
         refund_result?;
@@ -5058,12 +5182,14 @@ impl PredictifyHybrid {
             .unwrap_or_else(|_| String::from_str(&env, "unknown"))
     }
 
-    /// Remove the oldest `count` completed recovery history entries for a market (admin only).
+    /// Reject attempts to remove completed recovery history entries.
     ///
-    /// Active (unresolved) recovery state is never pruned. `count` is capped at 30.
+    /// Recovery history is an append-only audit trail. This compatibility
+    /// entrypoint always returns `Error::InvalidState` for an authorized admin.
     ///
     /// # Errors
     /// * `Unauthorized` - Caller is not admin
+    /// * `InvalidState` - Recovery history is immutable
     pub fn prune_recovery_history(
         env: Env,
         admin: Address,
@@ -5100,7 +5226,7 @@ impl PredictifyHybrid {
     ) -> crate::recovery::PendingMarketRecovery {
         Self::require_primary_admin_or_panic(&env, &admin);
 
-        match crate::recovery::RecoveryTimelockManager::initiate_recovery(
+        match crate::recovery::RecoveryTimelockConfig::initiate_recovery(
             &env,
             &admin,
             &market_id,
@@ -5135,7 +5261,7 @@ impl PredictifyHybrid {
     pub fn execute_market_recovery(env: Env, admin: Address, market_id: Symbol) -> bool {
         Self::require_primary_admin_or_panic(&env, &admin);
 
-        match crate::recovery::RecoveryTimelockManager::execute_recovery(&env, &admin, &market_id)
+        match crate::recovery::RecoveryTimelockConfig::execute_recovery(&env, &admin, &market_id)
         {
             Ok(success) => {
                 crate::audit_trail::AuditTrailManager::append_record(
@@ -5164,7 +5290,7 @@ impl PredictifyHybrid {
     pub fn cancel_market_recovery(env: Env, admin: Address, market_id: Symbol) {
         Self::require_primary_admin_or_panic(&env, &admin);
 
-        match crate::recovery::RecoveryTimelockManager::cancel_recovery(
+        match crate::recovery::RecoveryTimelockConfig::cancel_recovery(
             &env,
             &admin,
             &market_id,
@@ -5188,14 +5314,14 @@ impl PredictifyHybrid {
         env: Env,
         market_id: Symbol,
     ) -> Option<crate::recovery::PendingMarketRecovery> {
-        crate::recovery::RecoveryTimelockManager::get_pending(&env, &market_id)
+        crate::recovery::RecoveryTimelockConfig::get_pending(&env, &market_id)
     }
 
     /// Returns the current recovery timelock configuration.
     ///
     /// Read-only query; no authentication required.
     pub fn get_recovery_timelock_config(env: Env) -> crate::recovery::RecoveryTimelockConfig {
-        crate::recovery::RecoveryTimelockManager::get_config(&env)
+        crate::recovery::RecoveryTimelockConfig::get_config(&env)
     }
 
     // ===== VERSIONING FUNCTIONS =====
@@ -6034,7 +6160,312 @@ impl PredictifyHybrid {
         upgrade_manager::UpgradeManager::test_upgrade_safety(&env, &proposal)
     }
 
-    // ===== MARKET ANALYTICS FUNCTIONS =====
+    // ===== DELEGATION ENTRYPOINTS (Governance) =====
+
+    /// Establish a voting delegation from delegator to delegate.
+    ///
+    /// This entrypoint allows an account (delegator) to delegate voting rights
+    /// to another account (delegate), enabling institutional participants to
+    /// maintain voting authority in cold storage while delegating active voting
+    /// to a hot wallet.
+    ///
+    /// # Authentication
+    ///
+    /// Requires `delegator` authorization. The delegator must sign this transaction.
+    ///
+    /// # Parameters
+    ///
+    /// * `env` - The Soroban environment
+    /// * `delegator` - Account delegating voting rights (must authorize)
+    /// * `delegate` - Account receiving voting authority
+    ///
+    /// # Returns
+    ///
+    /// Returns `Result<(), Error>` where:
+    /// - `Ok(())` - Delegation established successfully
+    /// - `Err(Error)` - Validation or authorization failed
+    ///
+    /// # Errors
+    ///
+    /// This function returns:
+    /// - `Error::DelegationSelfDelegation` - Cannot delegate to self
+    /// - `Error::DelegationCircular` - Would create circular delegation
+    /// - `Error::Unauthorized` - Delegator did not authorize
+    ///
+    /// # Events
+    ///
+    /// Emits `set_delegate` governance event with delegator and delegate addresses.
+    ///
+    /// # Security Properties
+    ///
+    /// - Delegator-controlled: Only the delegator can establish the delegation
+    /// - Single active delegate: Each delegator can have only one active delegate
+    /// - Non-circular: System prevents A->B->A delegation chains
+    /// - No self-delegation: Cannot delegate to oneself
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Cold storage delegates to hot wallet
+    /// PredictifyHybrid::delegate_votes(
+    ///     env,
+    ///     cold_storage_address,
+    ///     hot_wallet_address,
+    /// )?;
+    /// ```
+    pub fn delegate_votes(
+        env: Env,
+        delegator: Address,
+        delegate: Address,
+    ) -> Result<(), Error> {
+        delegation::DelegationManager::delegate_votes(&env, delegator, delegate)
+    }
+
+    /// Revoke a voting delegation.
+    ///
+    /// This entrypoint removes a voting delegation, restoring full voting authority
+    /// to the delegator. Only the delegator can revoke their own delegation.
+    ///
+    /// # Authentication
+    ///
+    /// Requires `delegator` authorization. The delegator must sign this transaction.
+    ///
+    /// # Parameters
+    ///
+    /// * `env` - The Soroban environment
+    /// * `delegator` - Account that established the delegation
+    /// * `delegate` - Account currently holding voting authority
+    ///
+    /// # Returns
+    ///
+    /// Returns `Result<(), Error>` where:
+    /// - `Ok(())` - Delegation revoked successfully
+    /// - `Err(Error)` - Delegation not found or authorization failed
+    ///
+    /// # Errors
+    ///
+    /// This function returns:
+    /// - `Error::DelegationNotFound` - No delegation exists for this pair
+    /// - `Error::Unauthorized` - Delegator did not authorize
+    ///
+    /// # Events
+    ///
+    /// Emits `unset_delegate` governance event with delegator and delegate addresses.
+    ///
+    /// # Security Properties
+    ///
+    /// - Delegator-controlled: Only delegator can revoke
+    /// - Irreversible: Must re-establish delegation if needed
+    /// - Audited: Revocation recorded in history for compliance
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Delegator revokes their delegation
+    /// PredictifyHybrid::unset_delegate(
+    ///     env,
+    ///     cold_storage_address,
+    ///     hot_wallet_address,
+    /// )?;
+    /// ```
+    pub fn unset_delegate(
+        env: Env,
+        delegator: Address,
+        delegate: Address,
+    ) -> Result<(), Error> {
+        delegation::DelegationManager::unset_delegate(&env, delegator, delegate)
+    }
+
+    /// Revoke a delegation from the delegate's perspective.
+    ///
+    /// This entrypoint allows a delegate to revoke their own voting authority,
+    /// useful for emergency disabling if keys are compromised. This is a
+    /// self-revocation operation.
+    ///
+    /// # Authentication
+    ///
+    /// Requires `delegate` authorization. The delegate must sign this transaction.
+    ///
+    /// # Parameters
+    ///
+    /// * `env` - The Soroban environment
+    /// * `delegator` - Account that established the delegation
+    /// * `delegate` - Account revoking their own authority (must authorize)
+    ///
+    /// # Returns
+    ///
+    /// Returns `Result<(), Error>` where:
+    /// - `Ok(())` - Delegation revoked by delegate successfully
+    /// - `Err(Error)` - Delegation not found or authorization failed
+    ///
+    /// # Errors
+    ///
+    /// This function returns:
+    /// - `Error::DelegationNotFound` - No delegation exists for this pair
+    /// - `Error::Unauthorized` - Delegate did not authorize
+    ///
+    /// # Events
+    ///
+    /// Emits `unset_delegate` governance event with delegator and delegate addresses.
+    ///
+    /// # Use Cases
+    ///
+    /// - Delegate compromises its own keys and needs to self-disable
+    /// - Delegate wants to reduce authority scope
+    /// - Security incident response
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Hot wallet compromised - revoke its own authority
+    /// PredictifyHybrid::revoke_delegation(
+    ///     env,
+    ///     cold_storage_address,
+    ///     hot_wallet_address,
+    /// )?;
+    /// ```
+    pub fn revoke_delegation(
+        env: Env,
+        delegator: Address,
+        delegate: Address,
+    ) -> Result<(), Error> {
+        delegation::DelegationManager::revoke_delegation(&env, delegator, delegate)
+    }
+
+    /// Query whether a delegation exists between two addresses.
+    ///
+    /// This read-only entrypoint checks if a valid delegation exists from a
+    /// delegator to a delegate.
+    ///
+    /// # Parameters
+    ///
+    /// * `env` - The Soroban environment
+    /// * `delegator` - Account with voting rights
+    /// * `delegate` - Account with voting authority
+    ///
+    /// # Returns
+    ///
+    /// Returns `bool`:
+    /// - `true` - Delegation exists and is active
+    /// - `false` - No delegation found
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let has_delegation = PredictifyHybrid::has_delegation(
+    ///     env,
+    ///     cold_storage_address,
+    ///     hot_wallet_address,
+    /// );
+    ///
+    /// if has_delegation {
+    ///     println!("Cold storage has delegated to hot wallet");
+    /// }
+    /// ```
+    pub fn has_delegation(env: Env, delegator: Address, delegate: Address) -> bool {
+        delegation::DelegationManager::has_delegation(&env, &delegator, &delegate)
+    }
+
+    /// Get the currently active delegate for an account.
+    ///
+    /// This read-only entrypoint retrieves the account currently authorized to
+    /// vote on behalf of a delegator. Each delegator can have at most one active
+    /// delegate.
+    ///
+    /// # Parameters
+    ///
+    /// * `env` - The Soroban environment
+    /// * `delegator` - Account to query
+    ///
+    /// # Returns
+    ///
+    /// Returns `Option<Address>`:
+    /// - `Some(address)` - The current active delegate
+    /// - `None` - No active delegation
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// match PredictifyHybrid::get_active_delegate(env, cold_storage_address) {
+    ///     Some(delegate) => println!("Currently delegating to: {}", delegate),
+    ///     None => println!("No active delegation"),
+    /// }
+    /// ```
+    pub fn get_active_delegate(env: Env, delegator: Address) -> Option<Address> {
+        delegation::DelegationManager::get_active_delegate(&env, &delegator)
+    }
+
+    /// Get all delegations for a specific delegator.
+    ///
+    /// This read-only entrypoint retrieves all active delegations for an account.
+    /// Since each account can have at most one active delegate, this will return
+    /// at most one delegation.
+    ///
+    /// # Parameters
+    ///
+    /// * `env` - The Soroban environment
+    /// * `delegator` - Account to query
+    ///
+    /// # Returns
+    ///
+    /// Returns `Result<Vec<Delegation>, Error>`:
+    /// - `Ok(vec)` - Vector of delegations (0 or 1 element)
+    /// - `Err(Error)` - Storage error
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let delegations = PredictifyHybrid::get_delegations_by_delegator(
+    ///     env,
+    ///     cold_storage_address,
+    /// )?;
+    ///
+    /// for delegation in delegations {
+    ///     println!("Delegated since: {}", delegation.activated_at);
+    /// }
+    /// ```
+    pub fn get_delegations_by_delegator(
+        env: Env,
+        delegator: Address,
+    ) -> Result<Vec<delegation::Delegation>, Error> {
+        delegation::DelegationManager::get_delegations_by_delegator(&env, &delegator)
+    }
+
+    /// Get the revocation history for a delegator-delegate pair.
+    ///
+    /// This read-only entrypoint retrieves the complete audit trail of revocations
+    /// for compliance and forensic purposes.
+    ///
+    /// # Parameters
+    ///
+    /// * `env` - The Soroban environment
+    /// * `delegator` - Account that delegated
+    /// * `delegate` - Account that received delegation
+    ///
+    /// # Returns
+    ///
+    /// Returns `Result<Vec<Revocation>, Error>`:
+    /// - `Ok(vec)` - Vector of revocation records
+    /// - `Err(Error)` - Storage error
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let revocations = PredictifyHybrid::get_revocation_history(
+    ///     env,
+    ///     cold_storage_address,
+    ///     hot_wallet_address,
+    /// )?;
+    ///
+    /// println!("Revocations: {}", revocations.len());
+    /// ```
+    pub fn get_revocation_history(
+        env: Env,
+        delegator: Address,
+        delegate: Address,
+    ) -> Result<Vec<delegation::Revocation>, Error> {
+        delegation::DelegationManager::get_revocation_history(&env, &delegator, &delegate)
+    }
 
     /// Get comprehensive market statistics for data analysis and insights
     ///
@@ -7174,6 +7605,28 @@ mod tests {
         });
 
         market_id
+    }
+
+    #[test]
+    fn public_get_market_uses_instance_cache() {
+        let env = Env::default();
+        let contract_id = env.register(PredictifyHybrid, ());
+        let market_id = setup_resolved_market(&env, &contract_id);
+
+        env.as_contract(&contract_id, || {
+            assert!(PredictifyHybrid::get_market(env.clone(), market_id.clone()).is_some());
+            let ttl_after_miss = env.storage().persistent().get_ttl(&market_id);
+
+            env.ledger().with_mut(|ledger| {
+                ledger.sequence_number += 10;
+            });
+
+            assert!(PredictifyHybrid::get_market(env.clone(), market_id.clone()).is_some());
+            assert_eq!(
+                env.storage().persistent().get_ttl(&market_id),
+                ttl_after_miss - 10
+            );
+        });
     }
 
     #[test]
