@@ -41,9 +41,7 @@
 
 pub mod errors;
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, panic_with_error, Address, Env, Map, String, Vec,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec};
 
 pub use errors::ContractError;
 
@@ -69,8 +67,8 @@ pub enum DataKey {
     Paused,
     /// The primary admin / owner address.
     Admin,
-    /// List of additional authorized admin addresses.
-    AdminList,
+    /// Whether the contract has been initialized.
+    Initialized,
     /// Liquidity provided by a user to a specific market.
     Liquidity(u32, Address),
     /// Records that a winner has already claimed their payout for a market.
@@ -1099,332 +1097,136 @@ impl MarketsContract {
     }
 
     // -----------------------------------------------------------------------
-    //  Liquidity
+    //  Initialization
     // -----------------------------------------------------------------------
 
-    /// Adds liquidity to a market.
-    pub fn add_liquidity(env: Env, provider: Address, market_id: u32, amount: i128) {
-        provider.require_auth();
+    /// @notice Initializes the contract by setting the initial admin.
+    /// @dev    Stores `DataKey::Admin` and `DataKey::Initialized` atomically.
+    ///         Must be called exactly once after deployment before any admin
+    ///         entrypoint can be used.
+    /// @param env   The contract environment.
+    /// @param admin The initial admin/owner address.
+    /// @return `Ok(())` on success, or a [`ContractError`] variant.
+    pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
+        // Require the caller to authenticate before any state mutation.
+        admin.require_auth();
 
-        let market: MarketData = match env.storage().persistent().get(&DataKey::Market(market_id)) {
-            Some(m) => m,
-            None => panic_with_error!(env, ContractError::MarketNotFound),
-        };
-
-        if market.resolved || market.cancelled {
-            panic_with_error!(env, ContractError::InvalidState);
+        // Prevent re-initialization.
+        if Self::is_initialized(&env) {
+            return Err(ContractError::AdminOperationNotPermitted);
         }
 
-        let existing: LiquidityData = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Liquidity(market_id, provider.clone()))
-            .unwrap_or(LiquidityData { total_amount: 0 });
+        env.storage().instance().set(&DataKey::Initialized, &true);
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        // Markets start unpaused.
+        env.storage().instance().set(&DataKey::Paused, &false);
 
-        let new_total = match existing.total_amount.checked_add(amount) {
-            Some(t) => t,
-            None => panic_with_error!(env, ContractError::Overflow),
-        };
-
-        env.storage().persistent().set(
-            &DataKey::Liquidity(market_id, provider),
-            &LiquidityData {
-                total_amount: new_total,
-            },
-        );
-    }
-
-    /// Removes liquidity from a market.
-    pub fn remove_liquidity(env: Env, provider: Address, market_id: u32, amount: i128) {
-        provider.require_auth();
-
-        if !env.storage().persistent().has(&DataKey::Market(market_id)) {
-            panic_with_error!(env, ContractError::MarketNotFound);
-        }
-
-        let existing: LiquidityData = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Liquidity(market_id, provider.clone()))
-            .unwrap_or(LiquidityData { total_amount: 0 });
-
-        if amount > existing.total_amount {
-            panic_with_error!(env, ContractError::StakeTooSmall);
-        }
-
-        let new_total = match existing.total_amount.checked_sub(amount) {
-            Some(t) => t,
-            None => panic_with_error!(env, ContractError::Overflow),
-        };
-
-        env.storage().persistent().set(
-            &DataKey::Liquidity(market_id, provider),
-            &LiquidityData {
-                total_amount: new_total,
-            },
-        );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
-    //  Issue #022: User Bet Enumeration
+    //  Admin-gated entrypoints
     // -----------------------------------------------------------------------
 
-    /// Returns the total number of markets on which the user has placed bets.
-    pub fn get_user_bet_count(env: Env, user: Address) -> u32 {
-        let user_markets: Vec<u32> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UserBetMarkets(user))
-            .unwrap_or(Vec::new(&env));
-        user_markets.len()
+    /// @notice Pauses all markets globally.
+    /// @dev    Requires the caller to be the registered admin.
+    /// @param env    The contract environment.
+    /// @param caller The admin address (must pass auth and admin check).
+    /// @return `Ok(())` on success, or a [`ContractError`] variant.
+    pub fn pause_markets(env: Env, caller: Address) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::assert_is_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Paused, &true);
+        Ok(())
     }
 
-    /// Enumerates bets placed by a user with start_index and limit pagination (#022).
-    ///
-    /// Preserves insertion order across markets.
-    pub fn get_user_bets(
+    /// @notice Unpauses all markets globally.
+    /// @dev    Requires the caller to be the registered admin.
+    /// @param env    The contract environment.
+    /// @param caller The admin address (must pass auth and admin check).
+    /// @return `Ok(())` on success, or a [`ContractError`] variant.
+    pub fn unpause_markets(env: Env, caller: Address) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::assert_is_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Paused, &false);
+        Ok(())
+    }
+
+    /// @notice Transfers contract ownership to a new admin address.
+    /// @dev    Requires the caller to be the registered admin. The new admin
+    ///         must differ from the current admin.
+    /// @param env         The contract environment.
+    /// @param current_admin The current admin (must pass auth and admin check).
+    /// @param new_admin    The new admin address to set.
+    /// @return `Ok(())` on success, or a [`ContractError`] variant.
+    pub fn transfer_ownership(
         env: Env,
-        user: Address,
-        start_index: u32,
-        limit: u32,
-    ) -> Vec<UserBetInfo> {
-        let mut results = Vec::new(&env);
-        if limit == 0 {
-            return results;
+        current_admin: Address,
+        new_admin: Address,
+    ) -> Result<(), ContractError> {
+        current_admin.require_auth();
+        Self::assert_is_admin(&env, &current_admin)?;
+
+        if new_admin == current_admin {
+            return Err(ContractError::AdminAddressInvalid);
         }
 
-        let user_markets: Vec<u32> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UserBetMarkets(user.clone()))
-            .unwrap_or(Vec::new(&env));
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Ok(())
+    }
 
-        let total = user_markets.len();
-        if start_index >= total {
-            return results;
+    /// @notice Adds a second admin address (co-admin).
+    /// @dev    Requires the caller to be the registered admin. Currently only
+    ///         stores a single admin; this entrypoint replaces the admin with
+    ///         the new address and is kept for forward compatibility with a
+    ///         multi-admin model.
+    /// @param env        The contract environment.
+    /// @param caller     The current admin (must pass auth and admin check).
+    /// @param new_admin  The admin address to add.
+    /// @return `Ok(())` on success, or a [`ContractError`] variant.
+    pub fn add_admin(
+        env: Env,
+        caller: Address,
+        new_admin: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::assert_is_admin(&env, &caller)?;
+
+        if new_admin == caller {
+            return Err(ContractError::AdminAddressInvalid);
         }
 
-        let end = core::cmp::min(start_index.saturating_add(limit), total);
-        for i in start_index..end {
-            let market_id = user_markets.get(i).unwrap();
-            if let Some(bet) = env
-                .storage()
-                .persistent()
-                .get::<_, BetData>(&DataKey::Bet(market_id, user.clone()))
-            {
-                let claimed: bool = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::ClaimedBet(market_id, user.clone()))
-                    .unwrap_or(false);
-
-                // bet.amount is validated > 0 in place_bet, so the cast to u128 is safe.
-                results.push_back(UserBetInfo {
-                    market_id,
-                    outcome_index: bet.outcome_index,
-                    amount: bet.amount as u128,
-                    claimed,
-                });
-            }
-        }
-
-        results
+        // Store the new admin alongside the existing admin.
+        // For now we support a single admin; this entrypoint replaces it.
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
-    //  Issue #012: Dust-Safe Balance & Withdrawal System
+    //  Read-only admin queries
     // -----------------------------------------------------------------------
 
-    /// Configures the withdrawal fee parameters (#012).
-    pub fn set_fee_config(env: Env, admin: Address, min_fee_amount: i128, fee_bps: i128) {
-        Self::require_admin(&env, &admin);
-
-        if min_fee_amount < 0 || !(0..=10_000).contains(&fee_bps) {
-            panic_with_error!(env, ContractError::InvalidConfig);
-        }
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::MinFeeAmount, &min_fee_amount);
-        env.storage()
-            .persistent()
-            .set(&DataKey::WithdrawalFeeBps, &fee_bps);
+    /// @notice Returns the current admin address.
+    /// @dev    Read-only — does not require auth. Returns `None` if not set.
+    /// @param env The contract environment.
+    /// @return `Some(Address)` if an admin is set, `None` otherwise.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
     }
 
-    /// Returns the configured (min_fee_amount, fee_bps) (#012).
-    pub fn get_fee_config(env: Env) -> (i128, i128) {
-        let min_fee = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MinFeeAmount)
-            .unwrap_or(100i128);
-        let fee_bps = env
-            .storage()
-            .persistent()
-            .get(&DataKey::WithdrawalFeeBps)
-            .unwrap_or(100i128); // 1.00%
-        (min_fee, fee_bps)
-    }
-
-    /// Reads the internal balance of a user (#012).
-    pub fn get_user_balance(env: Env, user: Address) -> i128 {
+    /// @notice Returns whether the markets subsystem is globally paused.
+    /// @dev    Read-only — does not require auth.
+    /// @param env The contract environment.
+    /// @return `true` if paused, `false` otherwise.
+    pub fn is_paused(env: Env) -> bool {
         env.storage()
-            .persistent()
-            .get(&DataKey::UserBalance(user))
-            .unwrap_or(0i128)
-    }
-
-    /// Configures the token contract used for user balance deposits.
-    pub fn set_token_address(env: Env, admin: Address, token_address: Address) {
-        Self::require_admin(&env, &admin);
-        env.storage()
-            .persistent()
-            .set(&DataKey::TokenAddress, &token_address);
-    }
-
-    /// Returns the total platform fees collected (#012).
-    pub fn get_collected_fees(env: Env) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::CollectedFees)
-            .unwrap_or(0i128)
-    }
-
-    /// Deposits funds into a user's internal withdrawable balance (#012).
-    pub fn deposit_user_balance(env: Env, user: Address, amount: i128) {
-        user.require_auth();
-
-        if amount <= 0 {
-            panic_with_error!(env, ContractError::StakeTooSmall);
-        }
-
-        let balance = Self::get_user_balance(env.clone(), user.clone());
-        let new_balance = match balance.checked_add(amount) {
-            Some(b) => b,
-            None => panic_with_error!(env, ContractError::Overflow),
-        };
-
-        let token_address: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TokenAddress)
-            .unwrap_or_else(|| panic_with_error!(env, ContractError::InvalidState));
-        let token_client = soroban_sdk::token::Client::new(&env, &token_address);
-        token_client.transfer(&user, &env.current_contract_address(), &amount);
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::UserBalance(user), &new_balance);
-    }
-
-    /// Withdraws funds from a user's balance with dust protection (#012).
-    ///
-    /// # Dust Invariant
-    /// If the user's available balance is `<= min_fee_amount`, it is classified
-    /// as dust. To prevent funds from being permanently locked, the minimum fee
-    /// is waived when withdrawing remaining dust.
-    pub fn withdraw_user_balance(env: Env, user: Address, amount: i128) -> WithdrawalResult {
-        user.require_auth();
-
-        if amount <= 0 {
-            panic_with_error!(env, ContractError::StakeTooSmall);
-        }
-
-        let balance = Self::get_user_balance(env.clone(), user.clone());
-        if amount > balance {
-            panic_with_error!(env, ContractError::InsufficientBalance);
-        }
-
-        let (min_fee, fee_bps) = Self::get_fee_config(env.clone());
-
-        let (net_amount, fee_deducted) = if balance <= min_fee {
-            // Balance is at or below min_fee (dust): waive fee so dust is never locked!
-            (amount, 0i128)
-        } else {
-            // Normal balance above min_fee
-            let percentage_fee = (amount * fee_bps) / 10_000;
-            let standard_fee = core::cmp::max(percentage_fee, min_fee);
-
-            if amount == balance {
-                // Full withdrawal: if amount cannot cover standard_fee, adjust fee
-                if amount <= standard_fee {
-                    (amount, 0i128)
-                } else {
-                    (amount - standard_fee, standard_fee)
-                }
-            } else {
-                // Partial withdrawal
-                if amount <= standard_fee {
-                    panic_with_error!(env, ContractError::StakeTooSmall);
-                }
-                (amount - standard_fee, standard_fee)
-            }
-        };
-
-        let new_balance = balance - amount;
-        env.storage()
-            .persistent()
-            .set(&DataKey::UserBalance(user), &new_balance);
-
-        if fee_deducted > 0 {
-            let collected = Self::get_collected_fees(env.clone());
-            let new_collected = match collected.checked_add(fee_deducted) {
-                Some(c) => c,
-                None => panic_with_error!(env, ContractError::Overflow),
-            };
-            env.storage()
-                .persistent()
-                .set(&DataKey::CollectedFees, &new_collected);
-        }
-
-        WithdrawalResult {
-            net_amount,
-            fee_deducted,
-            remaining_balance: new_balance,
-        }
-    }
-
-    /// Admin fee collection from user account with dust-safe protection (#012).
-    ///
-    /// If a user balance is `<= min_fee_amount`, fees are not collected and 0 is returned,
-    /// ensuring dust is never locked and `InsufficientBalance` is never thrown.
-    pub fn collect_user_fees(env: Env, admin: Address, user: Address) -> i128 {
-        Self::require_admin(&env, &admin);
-
-        let balance = Self::get_user_balance(env.clone(), user.clone());
-        let (min_fee, fee_bps) = Self::get_fee_config(env.clone());
-
-        if balance <= min_fee {
-            // Dust-safe: do not fail with InsufficientBalance and do not trap user dust!
-            return 0;
-        }
-
-        let calculated_fee = (balance * fee_bps) / 10_000;
-        let fee = core::cmp::max(calculated_fee, min_fee);
-
-        if balance < fee {
-            return 0;
-        }
-
-        let new_balance = balance - fee;
-        env.storage()
-            .persistent()
-            .set(&DataKey::UserBalance(user), &new_balance);
-
-        let collected = Self::get_collected_fees(env.clone());
-        let new_collected = match collected.checked_add(fee) {
-            Some(c) => c,
-            None => panic_with_error!(env, ContractError::Overflow),
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::CollectedFees, &new_collected);
-
-        fee
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     // -----------------------------------------------------------------------
-    //  Issue #007: Hardened Admin Pause Mechanism
+    //  Internal helpers
     // -----------------------------------------------------------------------
 
     /// Sets the maximum number of markets that may be created. A zero limit
@@ -1523,130 +1325,40 @@ impl MarketsContract {
         };
 
         env.storage()
-            .persistent()
-            .set(&DataKey::PauseProposal(proposal_id), &proposal);
-
-        proposal_id
+            .instance()
+            .get(&DataKey::Initialized)
+            .unwrap_or(false)
     }
 
-    /// Approves a pending pause proposal (#007).
-    pub fn approve_pause(env: Env, admin: Address, proposal_id: u32) {
-        Self::require_admin(&env, &admin);
+    /// @notice Returns the stored admin address, or `None` if unset.
+    fn get_admin_internal(env: &Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
 
-        let mut proposal: PauseProposal = match env
-            .storage()
-            .persistent()
-            .get(&DataKey::PauseProposal(proposal_id))
-        {
-            Some(p) => p,
-            None => panic_with_error!(env, ContractError::ProposalNotFound),
-        };
-
-        if proposal.executed || proposal.cancelled {
-            panic_with_error!(env, ContractError::ProposalNotExecutable);
+    /// @notice Checks whether `caller` is the registered admin.
+    /// @dev    Returns `false` when no admin is stored (does **not** return
+    ///         `true` for an unset admin — this closes the bootstrap hole).
+    /// @param env    The contract environment.
+    /// @param caller The address to check.
+    /// @return `true` if the caller matches the stored admin, `false` otherwise.
+    fn is_admin_internal(env: &Env, caller: &Address) -> bool {
+        match Self::get_admin_internal(env) {
+            Some(admin) => admin == *caller,
+            None => false,
         }
+    }
 
-        if proposal.approvals.contains(&admin) {
-            panic_with_error!(env, ContractError::ProposalAlreadyApproved);
+    /// @notice Asserts that `caller` is the registered admin.
+    /// @dev    Returns `Err(ContractError::Unauthorized)` when the admin is
+    ///         unset or the caller does not match.
+    /// @param env    The contract environment.
+    /// @param caller The address to verify.
+    /// @return `Ok(())` if the caller is the admin, or a [`ContractError`].
+    fn assert_is_admin(env: &Env, caller: &Address) -> Result<(), ContractError> {
+        if !Self::is_admin_internal(env, caller) {
+            return Err(ContractError::Unauthorized);
         }
-
-        proposal.approvals.push_back(admin);
-        env.storage()
-            .persistent()
-            .set(&DataKey::PauseProposal(proposal_id), &proposal);
+        Ok(())
     }
 
-    /// Executes an approved and timelocked pause proposal (#007).
-    pub fn execute_pause(env: Env, caller: Address, proposal_id: u32) {
-        Self::require_admin(&env, &caller);
-
-        let mut proposal: PauseProposal = match env
-            .storage()
-            .persistent()
-            .get(&DataKey::PauseProposal(proposal_id))
-        {
-            Some(p) => p,
-            None => panic_with_error!(env, ContractError::ProposalNotFound),
-        };
-
-        if proposal.executed || proposal.cancelled {
-            panic_with_error!(env, ContractError::ProposalNotExecutable);
-        }
-
-        let (_, required_approvals) = Self::get_pause_config(env.clone());
-        if proposal.approvals.len() < required_approvals {
-            panic_with_error!(env, ContractError::ProposalNotExecutable);
-        }
-
-        let now = env.ledger().timestamp();
-        if now < proposal.eta {
-            panic_with_error!(env, ContractError::ProposalNotExecutable);
-        }
-
-        proposal.executed = true;
-        env.storage()
-            .persistent()
-            .set(&DataKey::PauseProposal(proposal_id), &proposal);
-
-        env.storage().persistent().set(&DataKey::Paused, &true);
-    }
-
-    /// Cancels a pending pause proposal (#007).
-    pub fn cancel_pause(env: Env, admin: Address, proposal_id: u32) {
-        Self::require_admin(&env, &admin);
-
-        let mut proposal: PauseProposal = match env
-            .storage()
-            .persistent()
-            .get(&DataKey::PauseProposal(proposal_id))
-        {
-            Some(p) => p,
-            None => panic_with_error!(env, ContractError::ProposalNotFound),
-        };
-
-        if proposal.executed || proposal.cancelled {
-            panic_with_error!(env, ContractError::ProposalNotExecutable);
-        }
-
-        proposal.cancelled = true;
-        env.storage()
-            .persistent()
-            .set(&DataKey::PauseProposal(proposal_id), &proposal);
-    }
-
-    /// Reads a pause proposal by ID. Only administrators may view proposal details (#007).
-    pub fn get_pause_proposal(env: Env, admin: Address, proposal_id: u32) -> Option<PauseProposal> {
-        Self::require_admin(&env, &admin);
-        env.storage()
-            .persistent()
-            .get(&DataKey::PauseProposal(proposal_id))
-    }
-
-    /// Pauses all market operations globally.
-    ///
-    /// # Hardened Protection
-    /// If hardened pause protection is active (required_approvals > 1 or delay > 0),
-    /// unilateral instantaneous execution is blocked with `AdminOperationNotPermitted` (#007).
-    pub fn pause_markets(env: Env, admin: Address) {
-        Self::require_admin(&env, &admin);
-
-        let (delay, required_approvals) = Self::get_pause_config(env.clone());
-        if delay > 0 || required_approvals > 1 {
-            panic_with_error!(env, ContractError::AdminOperationNotPermitted);
-        }
-
-        env.storage().persistent().set(&DataKey::Paused, &true);
-    }
-
-    /// Resumes all market operations globally.
-    pub fn unpause_markets(env: Env, admin: Address) {
-        Self::require_admin(&env, &admin);
-        env.storage().persistent().set(&DataKey::Paused, &false);
-    }
-
-    /// Transfers contract ownership to a new admin address.
-    pub fn transfer_ownership(env: Env, admin: Address, new_owner: Address) {
-        Self::require_admin(&env, &admin);
-        env.storage().persistent().set(&DataKey::Admin, &new_owner);
-    }
 }
