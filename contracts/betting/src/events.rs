@@ -227,6 +227,11 @@ pub struct BetStatsUpdatedEvent {
 // §4  Schema registry
 // ===================================================================
 
+/// Storage key used to persist the deployed schema version record.
+/// Frozen: changing this key would break any indexer that reads the
+/// deployment version from storage.
+const SCHEMA_RECORD_KEY: Symbol = symbol_short!("BtSchRec");
+
 /// Schema registry: maps a stable logical event name to its
 /// `(topic, schema_version)` pair at the current contract revision.
 ///
@@ -245,6 +250,41 @@ pub struct BetStatsUpdatedEvent {
 pub struct BettingEventSchema;
 
 impl BettingEventSchema {
+    /// Write the deployment schema version into instance storage so that
+    /// [`deployment_schema_version`] returns `Some(BETTING_EVENT_SCHEMA_VERSION)`
+    /// for every deployment that calls this during initialization.
+    ///
+    /// This method is idempotent: calling it more than once simply overwrites
+    /// the record with the same value.  It MUST be called from the contract's
+    /// `init` entrypoint so that indexers can immediately read the schema
+    /// version after deployment without having to wait for the first event.
+    ///
+    /// # Protocol invariant
+    ///
+    /// Any deployment that does not call this function will return `None` from
+    /// [`deployment_schema_version`], breaking indexers that rely on schema
+    /// versioning.  This is considered a deployment error.
+    pub fn ensure_schema_record(env: &Env) {
+        env.storage()
+            .instance()
+            .set(&SCHEMA_RECORD_KEY, &BETTING_EVENT_SCHEMA_VERSION);
+        env.storage()
+            .instance()
+            .extend_ttl(crate::INSTANCE_TTL_LEDGERS, crate::INSTANCE_TTL_LEDGERS);
+    }
+
+    /// Read back the schema version that was written by
+    /// [`ensure_schema_record`].
+    ///
+    /// Returns `None` when the contract was deployed without calling
+    /// `ensure_schema_record` (i.e. the init entrypoint was never invoked or
+    /// was an older version that predates this call).  Indexers MUST treat
+    /// `None` as an unversioned / legacy deployment and MAY refuse to index
+    /// events from such a deployment.
+    pub fn deployment_schema_version(env: &Env) -> Option<u32> {
+        env.storage().instance().get(&SCHEMA_RECORD_KEY)
+    }
+
     /// Look up the [`BettingEventSchemaEntry`] for a logical event name.
     ///
     /// # Arguments

@@ -69,6 +69,27 @@ const WITHDRAWAL_SCHEDULE_KEY: &str = "WithdrawalSchedule";
 /// Maximum platform fee percentage in basis points (100% = 10_000).
 const MAX_FEE_PERCENTAGE: i128 = 10_000;
 
+/// Hard protocol upper bound on `max_fee_amount` in stroops.
+///
+/// Set to 10_000_000_000 (10,000 XLM).  No admin can set a
+/// `max_fee_amount` higher than this value, even after contract
+/// upgrade, because the check lives inside `validate_fee_config` which
+/// is called on every config-mutating entrypoint.
+///
+/// # Rationale
+///
+/// Without this cap a compromised or malicious admin could set fees so
+/// high that any withdrawal leaves users with near-zero balances.
+/// 10,000 XLM is a generous operational ceiling that prevents such an
+/// attack while still accommodating any legitimate high-value use case.
+///
+/// # Protocol invariant
+///
+/// This constant MUST NOT be increased in future versions without a
+/// governance vote and an explicit security review.  Decreasing it is
+/// always safe.
+pub const MAX_FEE_AMOUNT: i128 = 10_000_000_000; // 10 000 XLM in stroops
+
 // ============================================================
 // Contract
 // ============================================================
@@ -145,7 +166,7 @@ impl FeesContract {
             platform_fee_percentage: 200, // 2.00%
             creation_fee: 0,
             min_fee_amount: 1,
-            max_fee_amount: 1_000_000_000_000, // 1M XLM in stroops
+            max_fee_amount: MAX_FEE_AMOUNT, // hard protocol cap: 10,000 XLM
             collection_threshold: 100_000_000, // 100 XLM
             fees_enabled: true,
         };
@@ -532,6 +553,12 @@ impl FeesContract {
             || config.max_fee_amount < 0
             || config.collection_threshold < 0
         {
+            return Err(ContractError::InvalidInput);
+        }
+        // Protocol invariant: max_fee_amount must never exceed the hard cap
+        // (MAX_FEE_AMOUNT = 10,000 XLM) regardless of who is calling.
+        // This prevents a compromised admin from draining users via sky-high fees.
+        if config.max_fee_amount > MAX_FEE_AMOUNT {
             return Err(ContractError::InvalidInput);
         }
         if config.min_fee_amount > config.max_fee_amount {
