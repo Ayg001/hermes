@@ -14,3 +14,7 @@ soroban-sdk = { workspace = true }
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 proptest = "1.2.0"
+
+[[test]]
+name = "auth_boundary"
+path = "tests/auth_boundary.rs"

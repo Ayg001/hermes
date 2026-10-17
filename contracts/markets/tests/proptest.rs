@@ -64,7 +64,7 @@ proptest! {
         
         if time_advance < cooldown {
             // Should fail due to cooldown
-            prop_assert_eq!(res2.unwrap_err().unwrap(), ContractError::AdminActionTimelocked);
+            prop_assert_eq!(res2.unwrap_err().unwrap(), ContractError::AdminCooldownActive);
         } else {
             // Should succeed
             prop_assert!(res2.is_ok());
